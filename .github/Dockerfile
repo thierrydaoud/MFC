@@ -1,0 +1,75 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG TARGET
+ARG CC_COMPILER
+ARG CXX_COMPILER
+ARG FC_COMPILER
+ARG COMPILER_PATH
+ARG COMPILER_LD_LIBRARY_PATH
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+RUN apt-get update -y && \
+    apt-get install -y software-properties-common ca-certificates gnupg wget && \
+    add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update -y && \
+    if [ "$TARGET" = "cpu" ]; then \
+        apt-get install -y \
+            build-essential git make cmake gcc g++ gfortran bc \
+            python3.12 python3.12-venv python3-pip \
+            openmpi-bin libopenmpi-dev libfftw3-dev \
+            mpich libmpich-dev; \
+    elif [ "$TARGET" = "gpu" ]; then \
+        apt-get install -y \
+            build-essential git make cmake bc \
+            python3.12 python3.12-venv python3-pip \
+            libfftw3-dev \
+            openmpi-bin libopenmpi-dev; \
+    fi && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+ENV OMPI_ALLOW_RUN_AS_ROOT=1
+ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+ENV HYDRA_LAUNCHER=fork
+ENV PATH="/opt/MFC:$PATH"
+
+COPY ../ /opt/MFC
+
+ENV CC=${CC_COMPILER}
+ENV CXX=${CXX_COMPILER}
+ENV FC=${FC_COMPILER}
+ENV PATH="${COMPILER_PATH}:/opt/mpich/bin:$PATH"
+ENV LD_LIBRARY_PATH="${COMPILER_LD_LIBRARY_PATH}:/opt/mpich/lib:${LD_LIBRARY_PATH:-}"
+
+# Pre-install numpy into the venv before mfc.sh runs, as it's required at
+# build time by several dependencies (pandas, cantera, matplotlib, etc.) that
+# may need to compile from source on architectures without pre-built wheels
+RUN python3.12 -m venv /opt/MFC/build/venv && \
+    /opt/MFC/build/venv/bin/pip install --upgrade pip && \
+    /opt/MFC/build/venv/bin/pip install numpy
+
+# Disable -Mfprelaxed for container builds only: NVHPC 24.5 crashes (llc RSQRT14
+# ICE, see cmake/GPU.cmake) on the GitHub Actions runner CPUs used to build these
+# images. Cluster/normal builds are unaffected.
+ENV MFC_CONTAINER_BUILD=1
+
+RUN echo "TARGET=$TARGET CC=$CC_COMPILER FC=$FC_COMPILER" && \
+    cd /opt/MFC && \
+    if [ "$TARGET" = "gpu" ]; then \
+      ./mfc.sh build --gpu acc -j $(nproc); \
+    else \
+      ./mfc.sh build -j $(nproc); \
+    fi
+
+RUN cd /opt/MFC && \
+    if [ "$TARGET" = "gpu" ]; then \
+      ./mfc.sh test -a --dry-run --gpu acc -j $(nproc); \
+    else \
+      ./mfc.sh test -a --dry-run -j $(nproc); \
+    fi
+
+WORKDIR /opt/MFC
+ENTRYPOINT ["tail", "-f", "/dev/null"]

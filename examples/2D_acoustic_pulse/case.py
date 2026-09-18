@@ -1,5 +1,5 @@
-import math
 import json
+import math
 
 # Numerical setup
 Nx = 99
@@ -38,27 +38,27 @@ print(
             "t_step_save": int(Nt / 100),
             # Simulation Algorithm Parameters
             "num_patches": 2,
-            "model_eqns": 2,
+            "model_eqns": "5eq",
             "alt_soundspeed": "F",
             "num_fluids": 1,
             "mpp_lim": "F",
             "mixture_err": "F",
-            "time_stepper": 3,
+            "time_stepper": "rk3",
             "weno_order": 5,
             "weno_eps": 1.0e-16,
             "mapped_weno": "T",
             "null_weights": "F",
             "mp_weno": "F",
-            "riemann_solver": 2,
-            "wave_speeds": 1,
-            "avg_state": 2,
+            "riemann_solver": "hllc",
+            "wave_speeds": "direct",
+            "avg_state": "arithmetic",
             "bc_x%beg": -8,
             "bc_x%end": -8,
             "bc_y%beg": -8,
             "bc_y%end": -8,
             # Formatted Database Files Structure Parameters
-            "format": 1,
-            "precision": 2,
+            "format": "silo",
+            "precision": "double",
             "prim_vars_wrt": "T",
             "parallel_io": "T",
             "omega_wrt(3)": "T",
@@ -81,8 +81,9 @@ print(
             "patch_icpp(2)%radius": 1.0,
             "patch_icpp(2)%vel(1)": 0,
             "patch_icpp(2)%vel(2)": 0,
-            "patch_icpp(2)%pres": f"{p_inf}*(1 - 0.5*({gam} - 1)*({alf_st})**2*exp(0.5*(1 - sqrt(x**2 + y**2))))**({gam} / ({gam} - 1))",
-            "patch_icpp(2)%alpha_rho(1)": f"{rho_inf}*(1 - 0.5*({gam} - 1)*({alf_st})**2*exp(0.5*(1 - sqrt(x**2 + y**2))))**(1 / ({gam} - 1))",
+            "patch_icpp(2)%pres": 0.0,
+            "patch_icpp(2)%alpha_rho(1)": 0.0,
+            "patch_icpp(2)%hcid": 281,
             "patch_icpp(2)%alpha(1)": 1.0,
             "patch_icpp(2)%alter_patch(1)": "T",
             # CBC Inflow / Outflow
@@ -96,7 +97,7 @@ print(
             "bc_y%pres_out": p_inf,
             # Fluids Physical Parameters
             "fluid_pp(1)%gamma": 1.0e00 / (gam - 1.0e00),
-            "fluid_pp(1)%pi_inf": 0.0,
+            "fluid_pp(1)%eos": "ideal_gas",
         }
     )
 )

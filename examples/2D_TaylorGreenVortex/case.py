@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import math
 import json
+import math
 
 gam_a = 1.4
 Mu = 10000  # Define the fluid's dynamic viscosity
@@ -29,12 +29,12 @@ print(
             "t_step_save": 100,
             # Simulation Algorithm Parameters
             "num_patches": 1,
-            "model_eqns": 2,
+            "model_eqns": "5eq",
             "alt_soundspeed": "F",
             "num_fluids": 1,
             "mpp_lim": "F",
             "mixture_err": "T",
-            "time_stepper": 3,
+            "time_stepper": "rk3",
             "weno_order": 5,
             "weno_eps": 1.0e-16,
             "mapped_weno": "T",
@@ -42,17 +42,17 @@ print(
             "mp_weno": "F",
             "weno_Re_flux": "T",
             "weno_avg": "T",
-            "riemann_solver": 2,
-            "wave_speeds": 1,
-            "avg_state": 2,
+            "riemann_solver": "hllc",
+            "wave_speeds": "direct",
+            "avg_state": "arithmetic",
             "bc_x%beg": -1,
             "bc_x%end": -1,
             "bc_y%beg": -1,
             "bc_y%end": -1,
             "viscous": "T",
             # Formatted Database Files Structure Parameters
-            "format": 1,
-            "precision": 2,
+            "format": "silo",
+            "precision": "double",
             "prim_vars_wrt": "T",
             "parallel_io": "T",
             # Patch 1: Base
@@ -70,7 +70,7 @@ print(
             "patch_icpp(1)%alpha(1)": 1.0,
             # Fluids Physical Parameters
             "fluid_pp(1)%gamma": 1.0e00 / (gam_a - 1.0e00),
-            "fluid_pp(1)%pi_inf": 0.0,
+            "fluid_pp(1)%eos": "ideal_gas",
             # Shear viscosity of STD air
             "fluid_pp(1)%Re(1)": 1 / Mu,
         }

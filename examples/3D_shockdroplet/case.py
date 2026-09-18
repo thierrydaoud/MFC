@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import math
 import json
+import math
 
 # athmospheric pressure - Pa (used as reference value)
 patm = 101325
@@ -18,7 +18,7 @@ ecc = 0.564
 # the droplet is about D0/8
 ISD = 5.0 / 8 * D0
 
-## pre-shock properties - AIR
+# pre-shock properties - AIR
 
 # pressure - Pa
 p0a = patm
@@ -35,7 +35,7 @@ pia = 0
 # speed of sound - M/s
 c_a = math.sqrt(gama * (p0a + pia) / rho0a)
 
-## Droplet - WATER
+# Droplet - WATER
 
 # surface tension - N / m
 st = 0.00e0
@@ -59,10 +59,10 @@ piw = 3.43e08
 c_w = math.sqrt(gamw * (p0w + piw) / rho0w)
 
 # Shock Mach number of interest. Note that the post-shock properties can be defined in terms of either
-# Min or psOp0a. Just comment/uncomment appropriatelly
+# Min or psOp0a. Just comment/uncomment appropriately
 Min = 2.4
 
-## Pos to pre shock ratios - AIR
+# Pos to pre shock ratios - AIR
 
 # pressure
 psOp0a = (Min**2 - 1) * 2 * gama / (gama + 1) + 1
@@ -77,7 +77,7 @@ Ms = math.sqrt((gama + 1.0) / (2.0 * gama) * (psOp0a - 1.0) * (p0a / (p0a + pia)
 # shock speed of sound - m/s
 ss = Ms * c_a
 
-## post-shock - AIR
+# post-shock - AIR
 
 # pressure - Pa
 ps = psOp0a * p0a
@@ -91,7 +91,7 @@ c_s = math.sqrt(gama * (ps + pia) / rhos)
 # velocity at the post shock - m/s
 vel = c_a / gama * (psOp0a - 1.0) * p0a / (p0a + pia) / Ms
 
-## Domain boundaries - m
+# Domain boundaries - m
 
 # x direction
 xb = -8.4707 * D0
@@ -145,7 +145,7 @@ dt = cfl * dx / ss
 # Save Frequency. Note that the number of autosaves will be SF + 1, as th IC (0.dat) is also saved
 SF = 400
 
-## making Nt divisible by SF
+# making Nt divisible by SF
 # 1 - ensure NtA goes slightly beyond tendA
 NtA = int(tendA // dt + 1)
 
@@ -193,20 +193,20 @@ print(
             "t_step_save": 100,
             # Simulation Algorithm Parameters
             "num_patches": 3,
-            "model_eqns": 2,
+            "model_eqns": "5eq",
             "alt_soundspeed": "F",
             "num_fluids": 2,
             "mpp_lim": "T",
             "mixture_err": "T",
-            "time_stepper": 3,
+            "time_stepper": "rk3",
             "weno_order": 3,
             "weno_eps": 1.0e-16,
             "weno_Re_flux": "F",
             "weno_avg": "F",
             "mapped_weno": "T",
-            "riemann_solver": 2,
-            "wave_speeds": 1,
-            "avg_state": 2,
+            "riemann_solver": "hllc",
+            "wave_speeds": "direct",
+            "avg_state": "arithmetic",
             "bc_x%beg": -6,
             "bc_x%end": -6,
             "bc_y%beg": -2,
@@ -214,8 +214,8 @@ print(
             "bc_z%beg": -2,
             "bc_z%end": -3,
             # Formatted Database Files Structure Parameters
-            "format": 1,
-            "precision": 2,
+            "format": "silo",
+            "precision": "double",
             "prim_vars_wrt": "T",
             "parallel_io": "T",
             # I will use 1 for WATER properties, and 2 for AIR properties
@@ -269,8 +269,10 @@ print(
             "patch_icpp(3)%alpha(2)": 0.0e00,
             # Fluids Physical Parameters
             "fluid_pp(1)%gamma": 1.0e00 / (gamw - 1),
+            "fluid_pp(1)%eos": "stiffened_gas",
             "fluid_pp(1)%pi_inf": gamw * piw / (gamw - 1),
             "fluid_pp(2)%gamma": 1.0e00 / (gama - 1),
+            "fluid_pp(2)%eos": "stiffened_gas",
             "fluid_pp(2)%pi_inf": gama * pia / (gama - 1),
         }
     )

@@ -19,12 +19,12 @@ print(
             "t_step_save": 1000,
             # Simulation Algorithm Parameters
             "num_patches": 2,
-            "model_eqns": 3,
+            "model_eqns": "6eq",
             "alt_soundspeed": "F",
             "num_fluids": 2,
             "mpp_lim": "T",
             "mixture_err": "T",
-            "time_stepper": 3,
+            "time_stepper": "rk3",
             "weno_order": 3,
             "weno_eps": 1.0e-16,
             "weno_Re_flux": "F",
@@ -32,14 +32,14 @@ print(
             "mapped_weno": "T",
             "null_weights": "F",
             "mp_weno": "F",
-            "riemann_solver": 2,
-            "wave_speeds": 1,
-            "avg_state": 2,
+            "riemann_solver": "hllc",
+            "wave_speeds": "direct",
+            "avg_state": "arithmetic",
             "bc_x%beg": -3,
             "bc_x%end": -3,
             # Formatted Database Files Structure Parameters
-            "format": 1,
-            "precision": 2,
+            "format": "silo",
+            "precision": "double",
             "prim_vars_wrt": "T",
             "parallel_io": "T",
             # Patch 1: Left state
@@ -65,9 +65,10 @@ print(
             "patch_icpp(2)%alpha(2)": 0.01e00,
             # Fluids Physical Parameters
             "fluid_pp(1)%gamma": 1.0e00 / (4.4e00 - 1.0e00),
+            "fluid_pp(1)%eos": "stiffened_gas",
             "fluid_pp(1)%pi_inf": 4.4e00 * 6.0e08 / (4.4e00 - 1.0e00),
             "fluid_pp(2)%gamma": 1.0e00 / (1.4e00 - 1.0e00),
-            "fluid_pp(2)%pi_inf": 0.0e00,
+            "fluid_pp(2)%eos": "ideal_gas",
         }
     )
 )

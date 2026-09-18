@@ -1,0 +1,108 @@
+#!/bin/bash
+
+# Pre-builds all benchmark cases with --case-optimization using --dry-run so
+# binaries are cached before the GPU run job. No simulation is executed.
+# Can run in two modes:
+#   1. Direct (Frontier login nodes): pass cluster/device/interface as args
+#   2. Inside SLURM (Phoenix/frontier_amd): uses $job_device/$job_interface
+# Usage: bash prebuild-case-optimization.sh [<cluster> <device> <interface>]
+
+set -e
+
+# Support both positional args (direct invocation) and env vars (SLURM)
+cluster="${1:-${job_cluster:-phoenix}}"
+job_device="${2:-$job_device}"
+job_interface="${3:-$job_interface}"
+
+# Derive module flag from cluster name
+case "$cluster" in
+    phoenix)      flag="p" ;;
+    frontier)     flag="f" ;;
+    frontier_amd) flag="famd" ;;
+    *) echo "ERROR: Unknown cluster '$cluster'"; exit 1 ;;
+esac
+
+# Benchmark list + optional sharding ("i/N", e.g. "1/3", set by
+# submit-slurm-job.sh's [shard] argument via $job_shard): shard i builds every
+# Nth case of the shared list. Unset = build all cases in one job (default;
+# other clusters). The list is the single source of truth shared with
+# run_case_optimization.sh so pre-built binaries and run cases never drift.
+source .github/scripts/case-optimization-benchmarks.sh
+caseopt_parse_shard
+shard="${job_shard:-}"
+shard_idx="$caseopt_shard_idx"
+shard_count="$caseopt_shard_count"
+
+# Phoenix starts fresh (no prior dep build); other clusters pre-build deps via
+# build.sh first, so we must preserve them and only clean MFC target staging.
+# Sharded jobs share one workspace and run concurrently, so the workflow
+# cleans once before submitting them — cleaning here would wipe a sibling
+# shard's in-progress build.
+if [ "$cluster" = "phoenix" ]; then
+    source .github/scripts/clean-build.sh
+    clean_build
+elif [ -z "$shard" ]; then
+    find build/staging -maxdepth 1 -regex '.*/\(gpu-acc\|gpu-mp\|cpu\)-.*' -type d -exec rm -rf {} + 2>/dev/null || true
+    find build/install -maxdepth 1 -regex '.*/\(gpu-acc\|gpu-mp\|cpu\)-.*' -type d -exec rm -rf {} + 2>/dev/null || true
+fi
+
+. ./mfc.sh load -c "$flag" -m g
+
+case "$job_interface" in
+    acc) gpu_opts="--gpu acc" ;;
+    omp) gpu_opts="--gpu mp" ;;
+    *)   echo "ERROR: prebuild requires gpu interface (acc or omp)"; exit 1 ;;
+esac
+
+# Case-optimized simulation builds land in per-case hash-named staging dirs,
+# but syscheck/pre_process/post_process hash identically across these cases.
+# Concurrent shards must not build those shared staging dirs simultaneously:
+# shard 1 builds them first and drops a done marker; other shards wait for it,
+# after which their builds no-op in the shared dirs.
+if [ -n "$shard" ] && [ "$shard_count" -gt 1 ]; then
+    shared_marker_done="build/.prebuild-shared-targets-done"
+    shared_marker_failed="build/.prebuild-shared-targets-failed"
+    first_case="${benchmarks[0]}"
+    if [ "$shard_idx" -eq 1 ]; then
+        # Remove both markers at the start so reruns and manual invocations
+        # never observe stale state from a prior run.
+        rm -f "$shared_marker_done" "$shared_marker_failed"
+        echo "=== Shard 1/$shard_count: building shared targets ==="
+        # Write the failure marker if the build exits non-zero so other shards
+        # can detect the failure immediately instead of waiting 90 minutes.
+        trap 'touch "$shared_marker_failed"' ERR
+        ./mfc.sh build -i "$first_case" -t syscheck pre_process post_process --case-optimization $gpu_opts -j 8
+        trap - ERR
+        touch "$shared_marker_done"
+    else
+        echo "=== Shard $shard_idx/$shard_count: waiting for shard 1 to build shared targets ==="
+        waited=0
+        until [ -f "$shared_marker_done" ]; do
+            if [ -f "$shared_marker_failed" ]; then
+                echo "ERROR: shard 1 failed to build shared targets; see shard 1 log"; exit 1
+            fi
+            if [ "$waited" -ge 5400 ]; then
+                echo "ERROR: timed out waiting for $shared_marker_done"; exit 1
+            fi
+            sleep 30
+            waited=$((waited + 30))
+        done
+    fi
+fi
+
+# Deliberately no node probe here. This pre-build is submitted as a *cpu*
+# allocation (see test.yml: it is --dry-run, so it only builds), while the
+# binaries it produces are GPU builds. syscheck built with --gpu therefore
+# asserts omp_get_num_devices() > 0 and exits non-zero on a node that has no
+# GPU by design -- which a probe would report as a bad node. It did: three
+# healthy Phoenix nodes were condemned and two excluded before the wrapper gave
+# up. The GPU allocation that actually runs these cases is probed instead, in
+# run_case_optimization.sh.
+
+idx=0
+for case in "${benchmarks[@]}"; do
+    idx=$((idx + 1))
+    caseopt_case_in_shard "$idx" || continue
+    echo "=== Pre-building: $case ==="
+    ./mfc.sh run "$case" --case-optimization $gpu_opts -j 8 --dry-run
+done

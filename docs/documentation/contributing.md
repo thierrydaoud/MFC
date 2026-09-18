@@ -1,0 +1,847 @@
+@page contributing Contributing
+
+# Contributing to MFC
+
+We welcome contributions of all kinds: bug fixes, new features, documentation, tests, and issue triage.
+This guide covers everything you need to get started and get your changes merged.
+
+## Getting Set Up
+
+1. **Fork and clone**
+   ```bash
+   git clone https://github.com/<your-user>/MFC.git
+   cd MFC
+   git remote add upstream https://github.com/MFlowCode/MFC.git
+   ```
+2. **Build MFC** (see @ref getting-started for full details):
+   ```bash
+   ./mfc.sh build -j $(nproc)
+   ```
+3. **Run the test suite** to verify your environment:
+   ```bash
+   ./mfc.sh test -j $(nproc)
+   ```
+
+## Architecture Overview
+
+Understanding MFC's structure helps you know where to make changes and what they affect.
+
+### Three-Phase Pipeline
+
+MFC runs simulations in three phases, each a separate Fortran executable:
+
+1. **pre_process** — Reads case parameters, generates initial conditions (patch geometries, flow states), writes binary grid and flow data to disk.
+2. **simulation** — Reads the initial state, advances the solution in time via TVD Runge-Kutta integration, writes solution snapshots at specified intervals.
+3. **post_process** — Reads simulation snapshots, computes derived quantities (vorticity, Schlieren, sound speed, etc.), writes Silo/HDF5 output for visualization.
+
+All three share code in `src/common/`. Only `simulation` is GPU-accelerated.
+
+### Directory Layout
+
+| Directory | Contents |
+|-----------|----------|
+| `src/simulation/` | Time-stepping, RHS, Riemann solvers, WENO, physics models (GPU-accelerated) |
+| `src/pre_process/` | Initial condition generation |
+| `src/post_process/` | Derived variable computation and formatted output |
+| `src/common/` | Derived types, global parameters, MPI, precision, I/O — shared by all three executables |
+| `toolchain/` | Python CLI, parameter system, case validation, build orchestration |
+| `tests/` | Golden files for 500+ regression tests |
+| `examples/` | Sample case files |
+| `docs/` | Doxygen documentation source |
+
+### Simulation Data Flow
+
+Each time step, `simulation` computes the right-hand side through this pipeline:
+
+```
+q_cons_vf (conservative variables: density, momentum, energy, volume fractions)
+    → convert to primitive (density, velocity, pressure)
+    → WENO reconstruction (left/right states at cell faces)
+    → Riemann solve (numerical fluxes)
+    → flux divergence + source terms (viscous, surface tension, body forces)
+    → RHS assembly
+    → Runge-Kutta update → q_cons_vf (next stage/step)
+```
+
+Key data structures (defined in `src/common/m_derived_types.fpp`):
+- `scalar_field` — wraps a 3D `real(stp)` array (`%%sf(i,j,k)`)
+- `vector_field` — array of `scalar_field` (`%%vf(1:sys_size)`)
+- `q_cons_vf` / `q_prim_vf` — conservative and primitive state vectors
+
+### Build Toolchain
+
+`./mfc.sh` is a shell wrapper that invokes the Python toolchain (`toolchain/main.py`), which orchestrates:
+
+1. **CMake** configures the build (compiler detection, dependencies, GPU backend)
+2. **Fypp** preprocesses `.fpp` files into `.f90` (expands GPU macros, code generation)
+3. **Fortran compiler** builds three executables from the generated `.f90` files
+
+See @ref parameters for the full list of ~3,400 simulation parameters. See @ref case_constraints for feature compatibility and example configurations.
+
+### How the Build Fits Together
+
+The build pipeline has four layers. Each layer has a single responsibility; the handoff
+between them is narrow.
+
+```
+mfc.sh (env bootstrap, venv, module loading, lock)
+  └─ toolchain/mfc/build.py (config slugs, cmake invocation)
+       └─ CMakeLists.txt + cmake/{GPU,Fypp,ParamsCodegen,MFCTargets}.cmake
+            └─ toolchain/mfc/params/generators/cmake_gen.py (writes 15 generated .fpp includes)
+```
+
+**`mfc.sh` → `build.py`.**  `mfc.sh` is a thin shell wrapper that activates the Python
+virtual environment, loads HPC modules, and delegates to `build.py`.  `build.py` calls
+`get_slug` to compute a human-readable variant identifier (`<prefix>-<10-hex>`, e.g.
+`gpu-acc-chem-f93aa400b9`) that encodes every build-affecting flag: GPU backend, precision
+mode, debug, chemistry, MPI.  Staging and install trees are namespaced by slug under
+`build/staging/` and `build/install/`, so multiple variants coexist without interfering.
+
+**CMake layer.**  `cmake/Fypp.cmake` defines `HANDLE_SOURCES`, which sets up one
+`add_custom_command` per `.fpp` file to run Fypp at build time.  `cmake/ParamsCodegen.cmake`
+registers a single ninja-tracked `add_custom_command` (DEPENDS all `params/*.py`) that
+invokes `cmake_gen.py` and writes the 15 generated includes under
+`build/include/<target>/`.  There is no configure-time generation: all 15 files are build
+outputs, so changing any `params/*.py` triggers only a targeted rebuild, not a full
+reconfigure.
+
+**Fypp and per-target stubs.**  Fypp resolves `#:include` at parse time, so every `.fpp`
+file sees exactly the include path for the target being compiled.  `src/common/` is
+compiled once per executable with the `MFC_<TARGET>` preprocessor define
+(`MFC_PRE_PROCESS`, `MFC_SIMULATION`, or `MFC_POST_PROCESS`) — this is intentional.
+It is what lets common modules include per-target generated files and gate
+simulation-only code with `#ifdef MFC_SIMULATION` without duplication.
+
+For which of the 15 files is manual vs. generated and what each contains, see the
+"How to Add a New Simulation Parameter" section below.
+
+## Development Workflow
+
+| Step | Command / Action |
+|------|-----------------|
+| Sync your fork | `git checkout master && git pull upstream master` |
+| Create a branch on your fork | `git checkout -b feature/<short-name>` |
+| Code, test, document | Follow the standards below |
+| Run tests | `./mfc.sh test` |
+| Commit | Clear, atomic commits (see below) |
+| Push to your fork | `git push origin feature/<short-name>` |
+| Open a PR | From your fork to `MFlowCode/MFC:master`. Every push triggers CI -- bundle changes to avoid flooding the queue |
+
+### Commit Messages
+
+- Start with a concise (50 chars or fewer) summary in imperative mood: `Fix out-of-bounds in EOS module`
+- Add a blank line, then a detailed explanation if needed
+- Reference related issues: `Fixes #123` or `Part of #456`
+
+## Coding Standards
+
+MFC is written in modern Fortran 2008+ with [Fypp](https://github.com/aradi/fypp) metaprogramming.
+The standards below are split into **hard rules** (enforced in CI and review) and **soft guidelines** (goals for new code).
+
+### Hard Rules
+
+These are enforced. CI and reviewers will flag violations.
+
+| Element | Rule |
+|---------|------|
+| Formatting | Enforced automatically by pre-commit hook (`./mfc.sh format` and `./mfc.sh lint`) |
+| Indentation | 2 spaces; continuation lines align beneath `&` |
+| Case | Lowercase keywords and intrinsics (`do`, `end subroutine`, ...) |
+| Modules | `m_<feature>` (e.g. `m_riemann_solvers`) |
+| Public subroutines | `s_<verb>_<noun>` (e.g. `s_compute_flux`) |
+| Public functions | `f_<verb>_<noun>` (e.g. `f_create_bbox`) |
+| Variables | Every argument has explicit `intent`; use `implicit none`, `dimension`/`allocatable`/`pointer` as appropriate |
+| Forbidden | `goto`, `COMMON` blocks, global `save` variables |
+| Error handling | Call `s_mpi_abort(<msg>)` -- never `stop` or `error stop` |
+| GPU macros | Do not use raw OpenACC/OpenMP pragmas. Use the project's Fypp GPU macros (see below) |
+| Compiler support | Code must compile with GNU gfortran, NVIDIA nvfortran, Cray ftn, and Intel ifx |
+
+### Soft Guidelines
+
+Aim for these in new and modified code. Existing code may not meet all of them.
+
+| Element | Guideline |
+|---------|-----------|
+| Routine size | Prefer subroutine ≤ 500 lines, helper ≤ 150, function ≤ 100, file ≤ 1000 |
+| Arguments | Prefer ≤ 6; consider a derived-type params struct for more |
+| DRY | Avoid duplicating logic; factor shared code into helpers |
+
+## Common Pitfalls
+
+This section documents domain-specific issues that frequently appear in MFC contributions.
+Both human reviewers and AI code reviewers reference this section.
+
+### Array Bounds and Indexing
+
+- MFC uses **non-unity lower bounds** (e.g., `idwbuff(1)%%beg:idwbuff(1)%%end` with negative ghost-cell indices). Always verify loop bounds match array declarations.
+- **Riemann solver indexing:** Left states at `j`, right states at `j+1`. Off-by-one here corrupts fluxes.
+- **Grid extents:** `m`, `n`, `p` are cell counts in x, y, z (1D sets `n = p = 0`, 2D sets `p = 0`). The interior is `0:m`, the ghost region `-buff_size:m+buff_size`, and cell boundaries run `x_cb(-1-buff_size:m+buff_size)`. Bounds are carried in `idwint(1:3)` (interior) and `idwbuff(1:3)` (with ghosts).
+- **`buff_size` is not a single formula.** It is set per reconstruction scheme in `s_configure_coordinate_bounds` (`src/common/m_helper_basic.fpp`) and floored higher for Lagrange bubbles and immersed boundaries. Read that routine rather than assuming a value.
+- **Never hard-code an equation index.** They live in the `eqn_idx` struct (`eqn_idx_info` in `src/common/m_derived_types.fpp`, populated by `s_initialize_eqn_idx` in `src/common/m_global_parameters_common.fpp`): `%%cont`, `%%mom`, `%%E`, `%%adv`, plus the optional ranges `%%bub`, `%%stress`, `%%species`, and `%%B`. Index positions depend on `model_eqns` and on which features are enabled, so changing either moves every index.
+
+### Precision and Type Safety
+
+- **`stp` vs `wp` mixing:** In mixed-precision mode, `stp` (storage) may be half-precision while `wp` (working) is double. Conversions between them must be intentional, especially in MPI pack/unpack and RHS accumulation.
+- **No double-precision intrinsics:** `dsqrt`, `dexp`, `dlog`, `dble`, `dabs`, `real(8)`, `real(4)` are forbidden. Use generic intrinsics with `wp` kind.
+- **MPI type matching:** `mpi_p` must match `wp`; `mpi_io_p` must match `stp`. Mismatches corrupt communicated data.
+- **Scalars into device routines that loop:** a `GPU_ROUTINE` containing any `GPU_LOOP` (itself or through what it calls) must be called with scalars, never an array element (`q%%sf(j,k,l)`, `alpha(i)`). Copy the element to a local first and receive results into a local. Cray OpenACC 19 to 21 miscompiles the pair silently at every routine level, OpenMP offload does not ([#1815](https://github.com/MFlowCode/MFC/issues/1815)); the linter enforces it inside kernels and device routines.
+
+### Memory and Allocation
+
+- **ALLOCATE/DEALLOCATE pairing:** Every `@:ALLOCATE()` must have a matching `@:DEALLOCATE()`. Missing deallocations leak GPU memory.
+- **`@:ACC_SETUP_VFs` / `@:ACC_SETUP_SFs`:** Vector/scalar fields must have GPU pointer setup before use in kernels.
+- **Conditional allocation:** If an array is allocated inside an `if` block, its deallocation must follow the same condition.
+- **Out-of-bounds access:** Fortran is permissive with assumed-shape arrays. Check that index arithmetic stays within declared bounds.
+
+### MPI Correctness
+
+- **Halo exchange:** Pack/unpack offset calculations (`pack_offset`, `unpack_offset`) must be correct for both interior and periodic boundaries. Off-by-one causes data corruption.
+- **GPU data coherence:** Non-RDMA MPI requires `GPU_UPDATE(host=...)` before send and `GPU_UPDATE(device=...)` after receive. Missing these causes stale data.
+- **Buffer sizing:** `halo_size` depends on dimensionality and QBMM state. `v_size` must account for extra bubble variables when QBMM is active.
+- **Deadlocks:** Mismatched send/recv counts or tags across MPI ranks.
+
+### Physics and Model Consistency
+
+- **Pressure formula** must match `model_eqns` value. Model 2/3 (multi-fluid), MHD, and hypoelastic each use different EOS formulations. Wrong formula = wrong physics.
+- **Conservative-primitive conversion:** Density recovery, kinetic energy, and pressure each have model-specific paths. Verify the correct branch is taken.
+- **Volume fractions** must sum to 1. `alpha_rho_K` must be non-negative. Species mass fractions should be clipped to [0,1].
+- **Boundary conditions:** Periodic BCs must match at both ends (`bc_x%%beg` and `bc_x%%end`). Cylindrical coordinates have special requirements (`bc_y%%beg = -14` for axis in 3D).
+- **Parameter constraints:** New parameters or physics features must be validated in `toolchain/mfc/case_validator.py`. New features should add corresponding validation.
+
+### Python Toolchain
+
+- New parameters in `toolchain/mfc/params/definitions.py` must have correct types, constraints, and tags.
+- Validation in `case_validator.py` must cover new interdependencies.
+- CLI schema in `toolchain/mfc/cli/commands.py` must match argument parsing.
+- Check subprocess calls for shell injection risks and missing error handling.
+
+### Parameter Plumbing
+
+- **Derived-type parameters are not auto-broadcast.** `generated_bcast.fpp` covers namelist *scalars* only. Each derived type (`chem_params`, `lag_params`, `rburn`) needs a hand-written `_emit_<name>` in `toolchain/mfc/params/generators/fortran_gen.py` plus its call site in that generator's simulation branch, and, if it is read on device, an explicit ``$:GPU_UPDATE(device='[name]')`` in both the target's `m_global_parameters.fpp` and `src/simulation/m_start_up.fpp` — `GPU_DECLARE` alone does not make it device-resident. Regrouping existing scalars into a derived type silently drops their broadcast, leaving every non-root rank holding the `dflt_real` sentinel. Single-rank golden files cannot catch this, so pair such a change with a `ppn=2` test and confirm it fails without the emitter.
+- **A `patch_ib` member that immersed-boundary ghost-point code reads must also be set in `s_add_cloud_particle`** (`src/simulation/m_particle_cloud.fpp`). `particle_cloud_ibs` is allocated without default initialization, and `s_reduce_ib_patch_array` copies the whole struct into `patch_ib`, overwriting the defaults assigned in `s_assign_default_values_to_user_inputs`. Anything left unset reaches the solver as uninitialized memory, and only where the allocation is not already zero-filled. A platform-only NaN is the signature of this class: a garbage `v_blow` once failed an AMD lane with `ICFL is NaN` while every NVIDIA lane and all local runs passed.
+- **Runtime checks go where they run.** Shared constraints belong in `src/common/m_checker_common.fpp`, simulation-only ones in `src/simulation/m_checker.fpp`, and pre- and post-process ones in their own `m_checker.fpp`. Those two `s_check_inputs` are currently empty; that is still the correct home for their checks, not `m_checker_common`.
+- **Analytic initial conditions are compiled into the binary** and their expressions are AST-validated at case load, so syntax errors and unknown variables surface immediately and by name. Each IC variable maps to an `eqn_idx` expression in `QPVF_IDX_VARS` (`toolchain/mfc/case.py`); adding a patch-settable conserved variable means updating that map and the Fortran `eqn_idx` builder together, because a mismatch is a silent wrong index.
+- **Under `--case-optimization` the baked-in constants are dropped from the namelist**, so changing one requires a rebuild rather than a case-file edit.
+
+### Compiler Portability
+
+- Any compiler-specific code (`#ifdef __INTEL_COMPILER` etc.) must have fallbacks for all four supported compilers.
+- Fypp macros must expand correctly for both GPU and CPU builds (macros are `#ifdef`'d out for non-GPU).
+- No hardcoded GPU architectures without CMake detection.
+
+### Architecture Notes
+
+- **`src/common/` affects all three executables** (pre_process, simulation, post_process). Changes here have wide blast radius.
+- No new global state; private helpers stay inside their defining module.
+- Flag modifications to public subroutine signatures, parameter defaults, or output formats.
+- Avoid unnecessary host/device transfers in hot loops, redundant allocations, and algorithmic inefficiency.
+
+## Fypp and GPU
+
+MFC uses [Fypp](https://github.com/aradi/fypp) macros (in `src/*/include/`) to generate accelerator-specific Fortran for OpenACC and OpenMP backends.
+Only `simulation` (plus its `common` dependencies) is GPU-accelerated.
+
+- **Raw OpenACC/OpenMP pragmas are not allowed.** Use the project's Fypp GPU macros instead.
+- Add `collapse(n)` when safe, declare loop-local variables with `private(...)`.
+- Avoid `stop`/`error stop` inside device code.
+- Keep macros simple and readable.
+
+See @ref gpuParallelization for the full GPU macro API reference, including all parameters, restrictions, examples, and debugging tools.
+
+## How-To Guides
+
+Step-by-step recipes for common development tasks.
+
+### How to Add a New Simulation Parameter
+
+Adding a parameter touches both the Python toolchain and Fortran source. Follow these steps in order. See @ref parameters for the full list of existing parameters and @ref case_constraints for feature compatibility.
+
+**Step 1: Register in Python** (`toolchain/mfc/params/definitions.py`)
+
+Add a call to `_r()` inside the `_load()` function:
+
+```python
+_r("my_param", REAL, {"my_feature_tag"},
+   desc="Description of the parameter",
+   math=r"\f$\xi\f$")
+```
+
+The arguments are:
+- **name**: parameter name (must match the Fortran namelist variable)
+- **type**: `INT`, `REAL`, `LOG`, `STR`, or `A_REAL` (analytic expression)
+- **tags**: set of feature tags for grouping (e.g. `{"bubbles"}`, `{"mhd"}`)
+- **desc**: human-readable description (optional; auto-generated from `_SIMPLE_DESCS` or `_ATTR_DESCS` if omitted)
+- **math**: LaTeX math symbol in Doxygen format (optional; shown in the Symbol column of @ref parameters)
+
+For indexed families like `fluid_pp`, put the symbol next to its attribute name using tuples:
+
+```python
+for f in range(1, NF + 1):
+    px = f"fluid_pp({f})%"
+    for a, sym in [("gamma", r"\f$\gamma_k\f$"),
+                   ("my_attr", r"\f$\xi_k\f$")]:  # <-- add here
+        _r(f"{px}{a}", REAL, math=sym)
+```
+
+**Step 2: Add constraints** (same file, `CONSTRAINTS` dict)
+
+If the parameter has valid ranges or choices:
+
+```python
+CONSTRAINTS = {
+    # ...
+    "my_param": {"min": 0, "max": 100},
+    # or: "my_param": {"choices": [1, 2, 3]},
+}
+```
+
+**Step 3: Add dependencies** (same file, `DEPENDENCIES` dict)
+
+If enabling one parameter requires or recommends others:
+
+```python
+DEPENDENCIES = {
+    # ...
+    "my_param": {
+        "when_true": {
+            "requires": ["other_param"],
+            "recommends": ["optional_param"],
+        }
+    },
+}
+```
+
+Triggers include `when_true` (logical is `T`), `when_set` (parameter is not `None`), and `when_value` (parameter equals a specific value).
+
+**Step 4: Add physics validation** (`toolchain/mfc/case_validator.py`)
+
+If the parameter has cross-parameter constraints that go beyond simple min/max:
+
+```python
+def check_my_feature(self):
+    if self.params["my_param"] > 0 and not self.params["other_param"]:
+        self.errors.append("my_param requires other_param to be set")
+```
+
+If your check enforces a physics constraint, also add a `PHYSICS_DOCS` entry (see [How to Document Physics Constraints](#how-to-document-physics-constraints) below).
+
+**Step 5: Fortran declaration and namelist binding (auto-generated)**
+
+Scalar declarations, GPU declare lines, Doxygen descriptions, and namelist bindings are
+auto-generated at build time (ninja-tracked custom command) from the `TYPED_DECLS` and `FORTRAN_ARRAY_DIMS`
+tables in `toolchain/mfc/params/definitions.py`. For a plain scalar registered with
+`_r()` / `_nv()` above, no manual Fortran edit is needed — the next build regenerates the
+include in `m_global_parameters_common.fpp` (compiled per target) automatically: the
+generation command is ninja-tracked against every file under `toolchain/mfc/params/`.
+
+Still manual (not auto-generated):
+
+- `TYPE` member definitions inside derived types in `src/common/m_derived_types.fpp`
+- Default-value assignments in `s_assign_default_values_to_user_inputs`
+- Multi-variable declaration lines (`bc_x/y/z`, `x/y/z_domain`, `x/y/z_output`)
+- MPI broadcast residue in `src/*/m_mpi_proxy.fpp` (computed/non-namelist variables such
+  as `m_glb`/`n_glb`/`p_glb`, `cfl_dt`, `bc_io`, and complex struct-member array loops;
+  namelist-registry scalars are broadcast via the auto-generated `generated_bcast.fpp`
+  include)
+- `CASE_OPT_EXTRA_LINES` in `toolchain/mfc/params/generators/fortran_gen.py` for case-optimization constants
+
+Editing any existing file under `toolchain/mfc/params/` (tables or generators) triggers
+regeneration on the next build automatically. Only *adding a new file* there requires one
+reconfigure — the dependency list is globbed at configure time.
+
+**Step 6: Use in Fortran code**
+
+Reference `my_param` anywhere in the target's modules. It is available as a global after the namelist is read at startup.
+
+### How to Write a GPU Parallel Loop
+
+All GPU loops use Fypp macros. See @ref gpuParallelization for the full API.
+
+**Simple parallel loop** (3D with collapse):
+
+```fortran
+$:GPU_PARALLEL_LOOP(collapse=3)
+do l = 0, p
+    do k = 0, n
+        do j = 0, m
+            q_sf(j, k, l) = 0._wp
+        end do
+    end do
+end do
+$:END_GPU_PARALLEL_LOOP()
+```
+
+**With private variables** (temporaries local to each thread):
+
+```fortran
+$:GPU_PARALLEL_LOOP(collapse=3, private='[rho, pres, vel]')
+do l = 0, p
+    do k = 0, n
+        do j = 0, m
+            rho = q_prim_vf(1)%sf(j, k, l)
+            pres = q_prim_vf(eqn_idx%E)%sf(j, k, l)
+            ! ... use rho, pres as thread-local ...
+        end do
+    end do
+end do
+$:END_GPU_PARALLEL_LOOP()
+```
+
+**With reduction:**
+
+```fortran
+$:GPU_PARALLEL_LOOP(collapse=3, &
+    & reduction='[[my_sum], [my_max]]', &
+    & reductionOp='[+, MAX]', &
+    & copy='[my_sum, my_max]')
+do l = 0, p
+    do k = 0, n
+        do j = 0, m
+            my_sum = my_sum + q_sf(j, k, l)
+            my_max = max(my_max, q_sf(j, k, l))
+        end do
+    end do
+end do
+$:END_GPU_PARALLEL_LOOP()
+```
+
+**Sequential inner loop** within a parallel region:
+
+```fortran
+$:GPU_PARALLEL_LOOP(collapse=3)
+do l = 0, p
+    do k = 0, n
+        do j = 0, m
+            $:GPU_LOOP(parallelism='[seq]')
+            do i = 1, num_fluids
+                alpha(i) = q_prim_vf(eqn_idx%adv%beg + i - 1)%sf(j, k, l)
+            end do
+        end do
+    end do
+end do
+$:END_GPU_PARALLEL_LOOP()
+```
+
+Key rules:
+- Always pair `$:GPU_PARALLEL_LOOP(...)` with `$:END_GPU_PARALLEL_LOOP()`
+- Use `collapse(n)` to fuse nested loops when the loop bounds are independent
+- Declare all loop-local temporaries in ``private='[...]'``
+- Never use `stop` or `error stop` inside a GPU loop
+
+### How to Allocate and Manage GPU Arrays
+
+The full lifecycle of a GPU-resident array:
+
+**Step 1: Declare** with GPU directive for module-level variables:
+
+```fortran
+real(wp), allocatable, dimension(:,:,:) :: my_array
+$:GPU_DECLARE(create='[my_array]')
+```
+
+**Step 2: Allocate** in your initialization subroutine:
+
+```fortran
+@:ALLOCATE(my_array(0:m, 0:n, 0:p))
+```
+
+`@:ALLOCATE` handles both the Fortran `allocate` and the GPU `enter data create`.
+
+**Step 3: Setup pointer fields** (only needed for derived types with pointer components like `scalar_field`):
+
+```fortran
+@:ALLOCATE(my_field%sf(0:m, 0:n, 0:p))
+@:ACC_SETUP_SFs(my_field)
+```
+
+`@:ACC_SETUP_SFs` registers the pointer with the GPU runtime (required on Cray).
+
+**Step 4: Deallocate** in your finalization subroutine, mirroring every allocation:
+
+```fortran
+@:DEALLOCATE(my_array)
+```
+
+If an array is allocated inside an `if` block, its deallocation must follow the same condition.
+
+### How to Add an Equation of State
+
+Every stiffened-gas expression lives in `src/common/m_variables_conversion.fpp`. Adding a second EOS
+means supplying these, not grepping for `gammas`:
+
+| Operator | Gives |
+|---|---|
+| `s_compute_mixture_coefficients` / `_dt` | mixture \f$\Gamma, \Pi_\infty, q_v\f$ from the phase fractions, and their time derivative |
+| `f_pressure` / `s_compute_energy` | \f$p(e)\f$ and \f$E(p)\f$ |
+| `f_bulk_modulus` | \f$K(p)\f$ - every sound speed in MFC is \f$K/\rho\f$, differing only in how phases are mixed |
+| `s_compute_speed_of_sound` / `_avg` | that mixing: Wood's law, 6-equation, bubble-diluted |
+| `s_phase_internal_energy` | per-phase internal energy (6-equation model) |
+| `f_isentrope_exponent` / `f_isentrope_pressure` | the isentrope \f$p + B = \textrm{const}\,\rho^n\f$ |
+| `f_sg_thermal` | the thermal law \f$p + B = (n-1)c_v\rho T\f$ |
+
+The first six are *mechanical* - they need only \f$p, \rho, e, c\f$. The last two are *caloric* and
+additionally need \f$c_v\f$ and \f$q'_v\f$. An EOS that supplies only the mechanical set cannot support
+phase change (`m_phase_change` also needs entropy and enthalpy) or reactive burn, so those features
+must be prohibited for it in `case_validator.py`.
+
+The coefficients arrive in two parameterizations of the same EOS: `gammas`/`pi_infs` are the stored
+forms the user supplies (see @ref sec-stored-forms), and `isentrope_n`/`isentrope_B` are the same EOS
+as \f$p + B = \textrm{const}\,\rho^n\f$, derived once at start-up. Convert with the `f_isentrope_*`
+operators rather than open-coding either relation.
+
+### How to Add a Test Case
+
+**Step 1: Create a case file**
+
+Test cases are Python scripts that print a JSON dict of parameters. See `examples/` for templates:
+
+```python
+#!/usr/bin/env python3
+import json
+
+print(json.dumps({
+    "run_time_info": "F",
+    "x_domain%beg": 0.0,
+    "x_domain%end": 1.0,
+    "m": 49,
+    "n": 0,
+    "p": 0,
+    "dt": 1e-6,
+    "t_step_start": 0,
+    "t_step_stop": 100,
+    "t_step_save": 100,
+    "num_patches": 1,
+    "model_eqns": 2,
+    "num_fluids": 1,
+    "time_stepper": 3,
+    "weno_order": 5,
+    "riemann_solver": 1,
+    "patch_icpp(1)%geometry": 1,
+    "patch_icpp(1)%x_centroid": 0.5,
+    "patch_icpp(1)%length_x": 1.0,
+    "patch_icpp(1)%vel(1)": 0.0,
+    "patch_icpp(1)%pres": 1.0,
+    "patch_icpp(1)%alpha_rho(1)": 1.0,
+    "patch_icpp(1)%alpha(1)": 1.0,
+    "fluid_pp(1)%gamma": 0.4,
+    "fluid_pp(1)%pi_inf": 0.0,
+}))
+```
+
+Keep grids small and runtimes short.
+
+**Step 2: Register as a regression test** (`toolchain/mfc/test/cases.py`)
+
+Add your case using the `Case` dataclass and the stack pattern for parameterized variations:
+
+```python
+stack.push("my_feature", {"my_param": value})
+cases.append(define_case_d(stack, '', {}))
+stack.pop()
+```
+
+**Step 3: Generate golden files**
+
+```bash
+./mfc.sh test --generate -o <test_id>
+```
+
+Golden files are stored as binary snapshots in `tests/<hash>/`.
+
+**Step 4: Run**
+
+```bash
+./mfc.sh test -j $(nproc)
+```
+
+### How to Create a New Fortran Module
+
+**Step 1: Create the file**
+
+Name it `src/<target>/m_<feature>.fpp`. CMake auto-discovers `.fpp` files — no build system changes needed.
+
+**Step 2: Use this boilerplate:**
+
+```fortran
+!> @file m_my_feature.fpp
+!! @brief Description of the module
+
+#:include 'case.fpp'
+#:include 'macros.fpp'
+
+module m_my_feature
+
+    use m_derived_types
+    use m_global_parameters
+    use m_mpi_proxy
+
+    implicit none
+
+    private; public :: s_initialize_my_feature, &
+                       s_compute_my_feature, &
+                       s_finalize_my_feature
+
+    ! Module-level data
+    real(wp), allocatable, dimension(:,:,:) :: work_array
+
+contains
+
+    !> Initialize module data
+    impure subroutine s_initialize_my_feature()
+        @:ALLOCATE(work_array(0:m, 0:n, 0:p))
+    end subroutine s_initialize_my_feature
+
+    !> Core computation
+    subroutine s_compute_my_feature(q_prim_vf, rhs_vf)
+        type(scalar_field), dimension(sys_size), intent(in) :: q_prim_vf
+        type(scalar_field), dimension(sys_size), intent(inout) :: rhs_vf
+        ! ...
+    end subroutine s_compute_my_feature
+
+    !> Clean up module data
+    impure subroutine s_finalize_my_feature()
+        @:DEALLOCATE(work_array)
+    end subroutine s_finalize_my_feature
+
+end module m_my_feature
+```
+
+**Step 3: Register the module in the architecture docs**
+
+Add your module name to the appropriate category in `docs/module_categories.json`. This ensures it appears on the @ref architecture "Code Architecture" page. The precheck linter will fail if a module is missing from this file.
+
+Key conventions:
+- `private` by default, explicitly `public` for the module API
+- Initialize/finalize subroutines for allocation lifecycle
+- Every `@:ALLOCATE` has a matching `@:DEALLOCATE`
+- Every argument has explicit `intent`
+
+### Working with the Precision System
+
+MFC supports double (default), single, and mixed precision. The types are defined in `src/common/m_precision_select.f90`:
+
+| Type | Purpose | Example |
+|------|---------|---------|
+| `wp` | Working precision (computation) | `real(wp) :: velocity` |
+| `stp` | Storage precision (I/O, field storage) | `real(stp), pointer :: sf(:,:,:)` |
+| `mpi_p` | MPI type matching `wp` | `call MPI_BCAST(var, 1, mpi_p, ...)` |
+| `mpi_io_p` | MPI type matching `stp` | Used in parallel I/O |
+
+Rules:
+- Use `real(wp)` for all computational variables
+- Literal constants need the `_wp` suffix: `1.0_wp`, `3.14159_wp`, `1e-6_wp`
+- Use **generic** intrinsics only: `sqrt`, `abs`, `sin`, `exp`, `log`, `max`, `min`
+- **Forbidden** double-precision intrinsics: `dsqrt`, `dexp`, `dlog`, `dble`, `dabs`, `real(8)`, `real(4)`
+- Conversions between `stp` and `wp` must be intentional, especially in MPI pack/unpack
+
+### How to Extend MPI Halo Exchange
+
+Halo exchange is in `src/simulation/m_mpi_proxy.fpp` (and `src/common/m_mpi_common.fpp` for buffer allocation).
+
+To add new data to the halo exchange:
+
+**Step 1: Update buffer sizing** (`src/common/m_mpi_common.fpp`)
+
+`v_size` determines how many variables are packed per cell. If your new data adds fields per cell, increase `v_size`:
+
+```fortran
+v_size = sys_size + my_extra_fields
+```
+
+**Step 2: Add pack loop** (`src/simulation/m_mpi_proxy.fpp`)
+
+Pack your data into the send buffer using a linear index:
+
+```fortran
+$:GPU_PARALLEL_LOOP(collapse=3, private='[j,k,l,r]')
+do l = 0, p
+    do k = 0, n
+        do j = 0, buff_size - 1
+            r = j + buff_size*(k + (n + 1)*l)
+            buff_send(r) = my_data%sf(j + pack_offset, k, l)
+        end do
+    end do
+end do
+$:END_GPU_PARALLEL_LOOP()
+```
+
+**Step 3: GPU data coherence**
+
+For non-RDMA MPI, add host/device transfers around the MPI call:
+
+```fortran
+$:GPU_UPDATE(host='[buff_send]')       ! GPU → CPU before send
+call MPI_SENDRECV(buff_send, ..., buff_recv, ..., ierr)
+$:GPU_UPDATE(device='[buff_recv]')     ! CPU → GPU after receive
+```
+
+**Step 4: Add unpack loop** mirroring the pack loop with `unpack_offset`.
+
+### How to Add a Post-Processing Output Variable
+
+Post-processing derived variables live in `src/post_process/m_derived_variables.fpp`.
+
+**Step 1: Allocate storage** in `s_initialize_derived_variables_module`:
+
+```fortran
+if (my_var_wrt) then
+    allocate(my_var_sf(-offset_x%beg:m + offset_x%end, &
+                       -offset_y%beg:n + offset_y%end, &
+                       -offset_z%beg:p + offset_z%end))
+end if
+```
+
+**Step 2: Create derivation subroutine:**
+
+```fortran
+subroutine s_derive_my_variable(q_prim_vf, q_sf)
+    type(scalar_field), dimension(sys_size), intent(in) :: q_prim_vf
+    real(wp), dimension(-offset_x%beg:m + offset_x%end, &
+                        -offset_y%beg:n + offset_y%end, &
+                        -offset_z%beg:p + offset_z%end), &
+        intent(inout) :: q_sf
+    integer :: i, j, k
+
+    do k = -offset_z%beg, p + offset_z%end
+        do j = -offset_y%beg, n + offset_y%end
+            do i = -offset_x%beg, m + offset_x%end
+                q_sf(i, j, k) = ! ... compute from q_prim_vf ...
+            end do
+        end do
+    end do
+end subroutine s_derive_my_variable
+```
+
+**Step 3: Call from output** in `m_data_output.fpp`:
+
+```fortran
+if (my_var_wrt) then
+    call s_derive_my_variable(q_prim_vf, q_sf)
+    call s_write_variable_to_formatted_database_file(q_sf, 'my_variable', dbfile, dbroot)
+end if
+```
+
+### Modifying `src/common/`
+
+Code in `src/common/` is compiled into all three executables (pre_process, simulation, post_process). Changes here have wide blast radius.
+
+Checklist:
+- Test all three targets: `./mfc.sh test` covers this
+- If adding GPU code, remember that only `simulation` is GPU-accelerated. Guard GPU macros with `#:if MFC_SIMULATION`
+- Check that new `use` statements don't create circular dependencies
+- New modules need `implicit none` and explicit `intent` on all arguments
+
+### Debugging
+
+See @ref troubleshooting for debugging workflows, profiling tools, GPU diagnostic environment variables, common build/runtime errors, and fixes.
+
+### How to Document Physics Constraints {#how-to-document-physics-constraints}
+
+When adding a new `check_` method to `case_validator.py`, document its physics by adding an entry to the `PHYSICS_DOCS` dict at the top of the file:
+
+```python
+PHYSICS_DOCS = {
+    ...
+    "check_my_feature": {
+        "title": "My Feature Constraint",          # Required: human-readable title
+        "category": "Thermodynamic Constraints",    # Required: groups the constraint in docs
+        "explanation": "Why this constraint exists.", # Required: plain English
+        "math": r"\alpha > 0",                      # Optional: LaTeX formula
+        "references": ["Wilfong26"],                # Optional: BibTeX keys from references.bib
+        "exceptions": ["IBM cases"],                # Optional: when constraint doesn't apply
+    },
+}
+```
+
+The @ref physics_constraints "Physics Constraints" page is **auto-generated** — run `./mfc.sh generate` to rebuild it.
+The generator merges your `PHYSICS_DOCS` entry with the AST-extracted `prohibit()`/`warn()` calls,
+so stage, severity, and parameter information appear automatically.
+
+**Fields:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `title` | Yes | Section heading in generated docs |
+| `category` | Yes | Grouping category (e.g., "Mixture Constraints") |
+| `explanation` | Yes | Plain English description of the physics |
+| `math` | No | LaTeX formula (rendered by Doxygen's MathJax) |
+| `references` | No | List of BibTeX cite keys from `docs/references.bib` |
+| `exceptions` | No | List of cases where the constraint doesn't apply |
+
+**Categories:** Thermodynamic Constraints, Mixture Constraints, Domain and Geometry, Velocity and Dimensional Consistency, Model Equations, Boundary Conditions, Bubble Physics, Feature Compatibility, Numerical Schemes, Acoustic Sources, Post-Processing.
+
+## Testing
+
+MFC has 500+ regression tests. See @ref testing for the full guide.
+
+- **Add tests** for any new feature or bug fix
+- Use `./mfc.sh test --generate` to create golden files for new cases
+- Keep tests fast: use small grids and short runtimes
+- Test with `-a` to include post-processing validation
+
+## CI Pipeline
+
+Every push to a PR triggers CI. Understanding the pipeline helps you fix failures quickly.
+
+### Lint Gate (runs first, blocks all other jobs)
+
+All five checks must pass before any builds start:
+
+1. **Formatting** — `./mfc.sh format` (auto-handled by pre-commit hook)
+2. **Spelling** — `./mfc.sh spelling`
+3. **Toolchain lint** — `./mfc.sh lint` (ruff + Python unit tests)
+4. **Source lint** — checks for:
+   - Raw `!$acc` or `!$omp` directives (must use Fypp GPU macros)
+   - Double-precision intrinsics (`dsqrt`, `dexp`, `dble`, etc.)
+5. **Doc references** — validates documentation cross-references
+
+### Build and Test Matrix
+
+After the lint gate passes:
+
+- **Platforms:** Ubuntu and macOS
+- **Compilers:** GNU (both), Intel OneAPI (Ubuntu only)
+- **Modes:** debug + release, MPI + no-MPI, double + single precision
+- **HPC runners:** Phoenix (NVIDIA/nvfortran), Frontier (AMD/Cray ftn) — both OpenACC and OpenMP backends
+- **Retries:** Tests retry up to 3 times before failing
+- **Cleanliness check:** Compiler warnings are tracked — your PR cannot increase the warning count
+
+### Common CI Failures
+
+| Failure | Fix |
+|---------|-----|
+| Formatting check | Pre-commit hook handles this; if you bypassed it, run `./mfc.sh format` |
+| Raw pragma detected | Replace `!$acc`/`!$omp` with Fypp GPU macros (see @ref gpuParallelization) |
+| Double-precision intrinsic | Use generic intrinsic with `wp` kind (e.g., `sqrt` not `dsqrt`) |
+| Golden file mismatch | If intentional: `./mfc.sh test --generate --only <UUID>` |
+| Warnings increased | Fix the new compiler warnings before merging |
+
+See @ref troubleshooting for detailed debugging workflows.
+
+## Documentation
+
+- Add or update **Doxygen docstrings** in source files for new public routines
+- Update **markdown docs** under `docs/` if user-facing behavior changes
+- Provide a minimal **example case** in `examples/` for new features when practical
+
+## Submitting a Pull Request
+
+1. **PRs come from your fork.** Do not create branches on `MFlowCode/MFC` directly. Push to your fork and open a PR from there against `MFlowCode/MFC:master`.
+2. **One PR = one logical change.** Split large changes into focused PRs.
+3. **Fill out the PR template.** Remove checklist items that don't apply.
+4. **Link issues** with `Fixes #<id>` or `Part of #<id>`.
+5. **Ensure CI passes** before requesting review. Run `./mfc.sh test` locally first. Formatting and linting are handled automatically by the pre-commit hook.
+6. **Describe your testing**: what you ran, which compilers/platforms you used.
+
+If your change touches GPU code (`src/simulation/`), see the GPU checklist in the PR template.
+
+## Code Review and Merge
+
+- Respond to reviewer comments promptly
+- Push focused updates; each push re-runs CI, so batch your fixes
+- A maintainer will merge your PR once all reviews are approved and CI is green
+
+If your PR is large or architectural, consider opening an issue first to discuss the approach.
+
+
+<div style='text-align:center; font-size:0.75rem; color:#888; padding:16px 0 0;'>Page last updated: 2026-02-15</div>

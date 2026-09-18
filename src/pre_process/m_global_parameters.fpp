@@ -1,279 +1,157 @@
 !>
-!! @file m_global_parameters.f90
+!! @file
 !! @brief Contains module m_global_parameters
 
 #:include 'case.fpp'
 
-!> @brief This module contains all of the parameters characterizing the
-!!              computational domain, simulation algorithm, initial condition
-!!              and the stiffened equation of state.
+!> @brief Defines global parameters for the computational domain, simulation algorithm, and initial conditions
 module m_global_parameters
 
 #ifdef MFC_MPI
-    use mpi                     ! Message passing interface (MPI) module
+    use mpi  ! Message passing interface (MPI) module
 #endif
 
-    use m_derived_types         ! Definitions of the derived types
-
-    use m_helper_basic          ! Functions to compare floating point numbers
-
-    use m_thermochem, only: num_species
+    use m_derived_types  ! Definitions of the derived types
+    use m_helper_basic  ! Functions to compare floating point numbers
+    ! Shared state: generated_decls, sys_size, eqn_idx, chemistry, shear_*
+    use m_global_parameters_common
 
     implicit none
 
     ! Logistics
-    integer :: num_procs            !< Number of processors
-    character(LEN=path_len) :: case_dir             !< Case folder location
-    logical :: old_grid             !< Use existing grid data
-    logical :: old_ic, non_axis_sym               !< Use existing IC data
-    integer :: t_step_old, t_step_start           !< Existing IC/grid folder
-
-    logical :: cfl_adap_dt, cfl_const_dt, cfl_dt
-    integer :: n_start, n_start_old
+    integer :: num_procs     !< Number of processors
+    logical :: non_axis_sym  !< Use existing IC data
+    logical :: cfl_dt
 
     ! Computational Domain Parameters
 
-    integer :: proc_rank !< Rank of the local processor
+    integer :: proc_rank  !< Rank of the local processor Number of cells in the x-, y- and z-coordinate directions
 
-    !! Number of cells in the x-, y- and z-coordinate directions
-    integer :: m
-    integer :: n
-    integer :: p
-
-    integer(8) :: nGlobal !< Global number of cells in the domain
-
-    integer :: m_glb, n_glb, p_glb !< Global number of cells in each direction
-
-    integer :: num_dims !< Number of spatial dimensions
-
-    logical :: cyl_coord
-    integer :: grid_geometry !< Cylindrical coordinates (either axisymmetric or full 3D)
-
-    real(wp), allocatable, dimension(:) :: x_cc, y_cc, z_cc !<
-    !! Locations of cell-centers (cc) in x-, y- and z-directions, respectively
-
-    real(wp), allocatable, dimension(:) :: x_cb, y_cb, z_cb !<
-    !! Locations of cell-boundaries (cb) in x-, y- and z-directions, respectively
-
-    real(wp) :: dx, dy, dz !<
-    !! Minimum cell-widths in the x-, y- and z-coordinate directions
-
-    type(bounds_info) :: x_domain, y_domain, z_domain !<
-    !! Locations of the domain bounds in the x-, y- and z-coordinate directions
-
-    logical :: stretch_x, stretch_y, stretch_z !<
-    !! Grid stretching flags for the x-, y- and z-coordinate directions
-
-    ! Parameters of the grid stretching function for the x-, y- and z-coordinate
-    ! directions. The "a" parameters are a measure of the rate at which the grid
-    ! is stretched while the remaining parameters are indicative of the location
-    ! on the grid at which the stretching begins.
-    real(wp) :: a_x, a_y, a_z
-    integer :: loops_x, loops_y, loops_z
-    real(wp) :: x_a, y_a, z_a
-    real(wp) :: x_b, y_b, z_b
+    !> @name Max and min number of cells in a direction of each combination of x-,y-, and z-
+    type(cell_num_bounds) :: cells_bounds
+    integer(kind=8)       :: nGlobal              !< Global number of cells in the domain
+    integer               :: m_glb, n_glb, p_glb  !< Global number of cells in each direction
+    integer               :: grid_geometry        !< Cylindrical coordinates (either axisymmetric or full 3D)
+    !> Locations of cell-centers (cc) in x-, y- and z-directions, respectively
+    real(wp), allocatable, dimension(:) :: x_cc, y_cc, z_cc
+    !> Locations of cell-boundaries (cb) in x-, y- and z-directions, respectively
+    real(wp), allocatable, dimension(:) :: x_cb, y_cb, z_cb
+    type(bounds_info) :: x_domain, y_domain, z_domain  !< Locations of the domain bounds in the x-, y- and z-coordinate directions
+    !> Global (pre-decomposition) domain bounds, needed by s_generate_serial_grid to stretch the grid using the full domain length
+    !! rather than a local processor's sub-domain length
+    type(bounds_info) :: x_domain_glb, y_domain_glb, z_domain_glb
 
     ! Simulation Algorithm Parameters
-    integer :: model_eqns            !< Multicomponent flow model
-    logical :: relax                 !< activate phase change
-    integer :: relax_model           !< Relax Model
-    real(wp) :: palpha_eps    !< trigger parameter for the p relaxation procedure, phase change model
-    real(wp) :: ptgalpha_eps  !< trigger parameter for the pTg relaxation procedure, phase change model
-    integer :: num_fluids            !< Number of different fluids present in the flow
-    logical :: mpp_lim               !< Alpha limiter
-    integer :: sys_size              !< Number of unknowns in the system of equations
-    integer :: weno_order            !< Order of accuracy for the WENO reconstruction
-    logical :: hypoelasticity        !< activate hypoelasticity
-    logical :: hyperelasticity       !< activate hyperelasticity
-    logical :: elasticity            !< elasticity modeling, true for hyper or hypo
-    integer :: b_size                !< Number of components in the b tensor
-    integer :: tensor_size           !< Number of components in the nonsymmetric tensor
-    logical :: pre_stress            !< activate pre_stressed domain
-    logical, parameter :: chemistry = .${chemistry}$. !< Chemistry modeling
-
+    ! sys_size, eqn_idx, chemistry, shear_*: in m_global_parameters_common
+    ! weno_polyn, muscl_polyn, num_dims, num_vels: in m_global_parameters_common
     ! Annotations of the structure, i.e. the organization, of the state vectors
-    type(int_bounds_info) :: cont_idx              !< Indexes of first & last continuity eqns.
-    type(int_bounds_info) :: mom_idx               !< Indexes of first & last momentum eqns.
-    integer :: E_idx                               !< Index of total energy equation
-    integer :: alf_idx                             !< Index of void fraction
-    integer :: n_idx                               !< Index of number density
-    type(int_bounds_info) :: adv_idx               !< Indexes of first & last advection eqns.
-    type(int_bounds_info) :: internalEnergies_idx  !< Indexes of first & last internal energy eqns.
-    type(bub_bounds_info) :: bub_idx               !< Indexes of first & last bubble variable eqns.
-    integer :: gamma_idx                           !< Index of specific heat ratio func. eqn.
-    integer :: pi_inf_idx                          !< Index of liquid stiffness func. eqn.
-    type(int_bounds_info) :: stress_idx            !< Indexes of elastic shear stress eqns.
-    type(int_bounds_info) :: xi_idx                !< Indexes of first and last reference map eqns.
-    integer :: c_idx                               !< Index of the color function
-    type(int_bounds_info) :: species_idx           !< Indexes of first & last concentration eqns.
-
-    ! Cell Indices for the (local) interior points (O-m, O-n, 0-p).
-    ! Stands for "InDices With BUFFer".
+    type(qbmm_idx_info) :: qbmm_idx  !< QBMM moment index mappings.
+    ! Cell Indices for the (local) interior points (O-m, O-n, 0-p). Stands for "InDices With BUFFer".
     type(int_bounds_info) :: idwint(1:3)
 
-    ! Cell Indices for the entire (local) domain. In simulation and post_process,
-    ! this includes the buffer region. idwbuff and idwint are the same otherwise.
-    ! Stands for "InDices With BUFFer".
+    ! Cell indices (InDices With BUFFer): includes buffer except in pre_process
     type(int_bounds_info) :: idwbuff(1:3)
+    type(int_bounds_info) :: bc_x, bc_y, bc_z  !< Boundary conditions in the x-, y- and z-coordinate directions
+    type(bc_xyz_info)     :: bc                !< Combined BC storage (used by the shared beta-buffer routines; pre-process-local)
+    ! simplex_params: auto-generated in generated_decls.fpp
+    ! shear_num/shear_indices/shear_BC_flip_*, bc: in m_global_parameters_common
+    integer                           :: fd_order    !< Finite-difference order for CoM/probe derivative approximations
+    integer                           :: fd_number   !< FD half-stencil size: MAX(1, fd_order/2)
+    type(bubbles_lagrange_parameters) :: lag_params  !< Lagrange bubbles' parameters (pre_process-local; not in generated_decls)
 
-    type(int_bounds_info) :: bc_x, bc_y, bc_z !<
-    !! Boundary conditions in the x-, y- and z-coordinate directions
+    ! fluid_rho (perturbs surrounding-air density to break grid symmetry): auto-generated in generated_decls.fpp
+    ! proc_coords, start_idx, mpiiofs, mpi_info_int: in m_global_parameters_common
 
-    logical :: parallel_io !< Format of the data files
-    logical :: file_per_process !< type of data output
-    integer :: precision !< Precision of output files
-
-    logical :: mixlayer_vel_profile !< Set hyperbolic tangent streamwise velocity profile
-    real(wp) :: mixlayer_vel_coef !< Coefficient for the hyperbolic tangent streamwise velocity profile
-    real(wp) :: mixlayer_domain !< Domain for the hyperbolic tangent streamwise velocity profile
-    logical :: mixlayer_perturb !< Superimpose instability waves to surrounding fluid flow
-
-    real(wp) :: pi_fac !< Factor for artificial pi_inf
-
-    ! Perturb density of surrounding air so as to break symmetry of grid
-    logical :: perturb_flow
-    integer :: perturb_flow_fluid   !< Fluid to be perturbed with perturb_flow flag
-    real(wp) :: perturb_flow_mag   !< Magnitude of perturbation with perturb_flow flag
-    logical :: perturb_sph
-    integer :: perturb_sph_fluid    !< Fluid to be perturbed with perturb_sph flag
-    real(wp), dimension(num_fluids_max) :: fluid_rho
-
-    integer, allocatable, dimension(:) :: proc_coords !<
-    !! Processor coordinates in MPI_CART_COMM
-
-    integer, allocatable, dimension(:) :: start_idx !<
-    !! Starting cell-center index of local processor in global grid
-
+    !> @name MPI domain-decomposition neighbor info (Lagrangian-bubble decomposition, #1290)
+    !> @{
+    type(int_bounds_info), dimension(3)    :: nidx
+    integer, allocatable, dimension(:,:,:) :: neighbor_ranks  !< Neighbor ranks
+    !> @}
 #ifdef MFC_MPI
-
     type(mpi_io_var), public :: MPI_IO_DATA
-    type(mpi_io_ib_var), public :: MPI_IO_IB_DATA
-    type(mpi_io_airfoil_ib_var), public :: MPI_IO_airfoil_IB_DATA
-    type(mpi_io_levelset_var), public :: MPI_IO_levelset_DATA
-    type(mpi_io_levelset_norm_var), public :: MPI_IO_levelsetnorm_DATA
-
-    character(LEN=name_len) :: mpiiofs
-    integer :: mpi_info_int !<
-    !! MPI info for parallel IO with Lustre file systems
-
 #endif
 
-    integer, private :: ierr
+    ! Initial Condition Parameters patch_icpp, patch_bc: auto-generated in generated_decls.fpp
+    logical :: bc_io  !< whether or not to save BC data
 
-    ! Initial Condition Parameters
-    integer :: num_patches     !< Number of patches composing initial condition
-
-    type(ic_patch_parameters), dimension(num_patches_max) :: patch_icpp !<
-    !! Database of the initial condition patch parameters (icpp) for each of the
-    !! patches employed in the configuration of the initial condition. Note that
-    !! the maximum allowable number of patches, num_patches_max, may be changed
-    !! in the module m_derived_types.f90.
-
-    ! Fluids Physical Parameters
-    type(physical_parameters), dimension(num_fluids_max) :: fluid_pp !<
-    !! Database of the physical parameters of each of the fluids that is present
-    !! in the flow. These include the stiffened gas equation of state parameters,
-    !! the Reynolds numbers and the Weber numbers.
-
-    real(wp) :: rhoref, pref !< Reference parameters for Tait EOS
-
+    ! Fluids Physical Parameters fluid_pp, bub_pp: auto-generated in generated_decls.fpp
+    type(chemistry_parameters) :: chem_params
     !> @name Bubble modeling
     !> @{
-    integer :: nb
-    real(wp) :: R0ref
-    real(wp) :: Ca, Web, Re_inv
-    real(wp), dimension(:), allocatable :: weight, R0, V0
-    logical :: bubbles_euler
-    logical :: qbmm      !< Quadrature moment method
-    integer :: nmom  !< Number of carried moments
-    real(wp) :: sigR, sigV, rhoRV !< standard deviations in R/V
-    logical :: adv_n !< Solve the number density equation and compute alpha from number density
+    real(wp)                            :: Eu
+    real(wp), dimension(:), allocatable :: weight, R0
+    integer                             :: nmom  !< Number of carried moments
     !> @}
 
     !> @name Immersed Boundaries
     !> @{
-    logical :: ib           !< Turn immersed boundaries on
-    integer :: num_ibs      !< Number of immersed boundaries
-    integer :: Np
-
-    type(ib_patch_parameters), dimension(num_patches_max) :: patch_ib
-
-    type(probe_parameters), allocatable, dimension(:) :: airfoil_grid_u, airfoil_grid_l
-    !! Database of the immersed boundary patch parameters for each of the
-    !! patches employed in the configuration of the initial condition. Note that
-    !! the maximum allowable number of patches, num_patches_max, may be changed
-    !! in the module m_derived_types.f90.
-
+    ! patch_ib, ib_airfoil, stl_models: auto-generated in generated_decls.fpp
+    !> Per-airfoil computed surface grids (unused in pre_process)
+    type(ib_airfoil_grid), allocatable, dimension(:) :: ib_airfoil_grids
     !> @}
 
     !> @name Non-polytropic bubble gas compression
     !> @{
-    logical :: polytropic
-    logical :: polydisperse
-    integer :: thermal  !1 = adiabatic, 2 = isotherm, 3 = transfer
-    real(wp) :: R_n, R_v, phi_vn, phi_nv, Pe_c, Tw, pv, M_n, M_v
-    real(wp), dimension(:), allocatable :: k_n, k_v, pb0, mass_n0, mass_v0, Pe_T
+    real(wp) :: phi_vg, phi_gv, Pe_c, Tw, k_vl, k_gl
+    real(wp) :: gam_m
+    real(wp), dimension(:), allocatable :: pb0, mass_g0, mass_v0, Pe_T, k_v, k_g
     real(wp), dimension(:), allocatable :: Re_trans_T, Re_trans_c, Im_trans_T, Im_trans_c, omegaN
-    real(wp) :: mul0, ss, gamma_v, mu_v
-    real(wp) :: gamma_m, gamma_n, mu_n
-    real(wp) :: poly_sigma
-    integer :: dist_type !1 = binormal, 2 = lognormal-normal
-    integer :: R0_type   !1 = simpson
+    real(wp) :: p0ref, rho0ref, T0ref, ss, pv, vd, mu_l, mu_v, mu_g, gam_v, gam_g, M_v, M_g, cp_v, cp_g, R_v, R_g
     !> @}
 
-    !> @name Surface Tension Modeling
-    !> @{
-    real(wp) :: sigma
-    logical :: surface_tension
-    !> @}
+    integer, allocatable, dimension(:,:,:) :: logic_grid
+    type(pres_field)                       :: pb
+    type(pres_field)                       :: mv
+    integer                                :: buff_size  !< Number of ghost cells for boundary condition storage
 
-    !> @name Index variables used for m_variables_conversion
-    !> @{
-    integer :: momxb, momxe
-    integer :: advxb, advxe
-    integer :: contxb, contxe
-    integer :: intxb, intxe
-    integer :: bubxb, bubxe
-    integer :: strxb, strxe
-    integer :: xibeg, xiend
-    integer :: chemxb, chemxe
-    !> @}
-
-    !> @ lagrangian solver parameters
-    logical :: rkck_adap_dt
-    !> @}
-
-    integer, allocatable, dimension(:, :, :) :: logic_grid
-
-    type(pres_field) :: pb
-    type(pres_field) :: mv
+    ! Variables for hardcoded initial conditions that are read from input files
+    character(LEN=2*path_len) :: interface_file
+    real(wp)                  :: normFac, normMag, g0_ic, p0_ic
 
 contains
 
-    !>  Assigns default values to user inputs prior to reading
-        !!              them in. This allows for an easier consistency check of
-        !!              these parameters once they are read from the input file.
-    subroutine s_assign_default_values_to_user_inputs
+    !> Assigns default values to user inputs prior to reading them in. This allows for an easier consistency check of these
+    !! parameters once they are read from the input file.
+    impure subroutine s_assign_default_values_to_user_inputs
 
-        integer :: i !< Generic loop operator
+        integer :: i  !< Generic loop operator
 
-        ! Logistics
-        case_dir = '.'
+        ! Shared defaults (case_dir, m/n/p, cyl_coord, cfl flags, model_eqns, BC blocks,
+        ! recon/weno/muscl/num_fluids/igr/mhd/relativity under case-opt guard, Tait EOS, bubble flags,
+        ! IB flags, parallel I/O flags, fft_wrt)
+
+        call s_assign_common_defaults
+
+        ! Boundary conditions (bc_x/y/z are per-target declarations, not visible in common)
+        bc_x%beg = dflt_int; bc_x%end = dflt_int
+        bc_y%beg = dflt_int; bc_y%end = dflt_int
+        bc_z%beg = dflt_int; bc_z%end = dflt_int
+
+        #:for DIM in ['x', 'y', 'z']
+            #:for DIR in [1, 2, 3]
+                bc_${DIM}$%vb${DIR}$ = 0._wp
+                bc_${DIM}$%ve${DIR}$ = 0._wp
+            #:endfor
+        #:endfor
+
+        #:for dir in ['x', 'y', 'z']
+            bc_${dir}$%isothermal_in = .false.
+            bc_${dir}$%isothermal_out = .false.
+            bc_${dir}$%Twall_in = dflt_real
+            bc_${dir}$%Twall_out = dflt_real
+        #:endfor
+
+        call s_update_cell_bounds(cells_bounds, m, n, p)
+
+        ! Logistics (pre-specific)
+        file_extension = '000000'
+        files_dir = './'
         old_grid = .false.
         old_ic = .false.
         t_step_old = dflt_int
-        t_step_start = dflt_int
-
-        cfl_adap_dt = .false.
-        cfl_const_dt = .false.
         cfl_dt = .false.
-        n_start = dflt_int
 
-        ! Computational domain parameters
-        m = dflt_int; n = 0; p = 0
-
-        cyl_coord = .false.
-
+        ! Computational domain parameters (pre-specific)
         x_domain%beg = dflt_real
         x_domain%end = dflt_real
         y_domain%beg = dflt_real
@@ -298,57 +176,60 @@ contains
         z_a = dflt_real
         z_b = dflt_real
 
-        ! Simulation algorithm parameters
-        model_eqns = dflt_int
-        relax = .false.
-        relax_model = dflt_int
+        ! Simulation algorithm parameters (pre-specific)
         palpha_eps = dflt_real
         ptgalpha_eps = dflt_real
-        num_fluids = dflt_int
-        weno_order = dflt_int
-
-        hypoelasticity = .false.
-        hyperelasticity = .false.
-        elasticity = .false.
-        pre_stress = .false.
-        b_size = dflt_int
-        tensor_size = dflt_int
-
-        bc_x%beg = dflt_int; bc_x%end = dflt_int
-        bc_y%beg = dflt_int; bc_y%end = dflt_int
-        bc_z%beg = dflt_int; bc_z%end = dflt_int
-
-        #:for DIM in ['x', 'y', 'z']
-            #:for DIR in [1, 2, 3]
-                bc_${DIM}$%vb${DIR}$ = 0._wp
-                bc_${DIM}$%ve${DIR}$ = 0._wp
-            #:endfor
-        #:endfor
-
-        parallel_io = .false.
-        file_per_process = .false.
+        igr_order = dflt_int
         precision = 2
         mixlayer_vel_profile = .false.
         mixlayer_vel_coef = 1._wp
-        mixlayer_domain = 1._wp
         mixlayer_perturb = .false.
+        mixlayer_perturb_nk = 100
+        mixlayer_perturb_k0 = 0.4446_wp
         perturb_flow = .false.
         perturb_flow_fluid = dflt_int
         perturb_flow_mag = dflt_real
         perturb_sph = .false.
         perturb_sph_fluid = dflt_int
         fluid_rho = dflt_real
+        elliptic_smoothing_iters = dflt_int
+        elliptic_smoothing = .false.
+
+        simplex_perturb = .false.
+        simplex_params%perturb_vel(:) = .false.
+        simplex_params%perturb_vel_freq(:) = dflt_real
+        simplex_params%perturb_vel_scale(:) = dflt_real
+        simplex_params%perturb_vel_offset(:,:) = dflt_real
+        simplex_params%perturb_dens(:) = .false.
+        simplex_params%perturb_dens_freq(:) = dflt_real
+        simplex_params%perturb_dens_scale(:) = dflt_real
+        simplex_params%perturb_dens_offset(:,:) = dflt_real
 
         ! Initial condition parameters
         num_patches = dflt_int
 
+        fd_order = dflt_int
+        lag_params%cluster_type = dflt_int
+        lag_params%pressure_corrector = .false.
+        lag_params%smooth_type = dflt_int
+        lag_params%heatTransfer_model = .false.
+        lag_params%massTransfer_model = .false.
+        lag_params%write_bubbles = .false.
+        lag_params%write_bubbles_stats = .false.
+        lag_params%write_void_evol = .false.
+        lag_params%pressure_force = .false.
+        lag_params%gravity_force = .false.
+        lag_params%nBubs_glb = dflt_int
+        lag_params%vel_model = dflt_int
+        lag_params%drag_model = dflt_int
+        lag_params%epsilonb = 1._wp
+        lag_params%charwidth = dflt_real
+        lag_params%charNz = dflt_int
+        lag_params%valmaxvoid = dflt_real
+
         do i = 1, num_patches_max
             patch_icpp(i)%geometry = dflt_int
-            patch_icpp(i)%model_scale(:) = 1._wp
-            patch_icpp(i)%model_translate(:) = 0._wp
-            patch_icpp(i)%model_filepath(:) = dflt_char
-            patch_icpp(i)%model_spc = num_ray
-            patch_icpp(i)%model_threshold = ray_tracing_threshold
+            patch_icpp(i)%model_id = 0
             patch_icpp(i)%x_centroid = dflt_real
             patch_icpp(i)%y_centroid = dflt_real
             patch_icpp(i)%z_centroid = dflt_real
@@ -376,6 +257,9 @@ contains
             patch_icpp(i)%qv = 0._wp
             patch_icpp(i)%qvp = 0._wp
             patch_icpp(i)%tau_e = 0._wp
+            patch_icpp(i)%Bx = dflt_real
+            patch_icpp(i)%By = dflt_real
+            patch_icpp(i)%Bz = dflt_real
             patch_icpp(i)%a(2) = dflt_real
             patch_icpp(i)%a(3) = dflt_real
             patch_icpp(i)%a(4) = dflt_real
@@ -385,8 +269,14 @@ contains
             patch_icpp(i)%a(8) = dflt_real
             patch_icpp(i)%a(9) = dflt_real
             patch_icpp(i)%non_axis_sym = .false.
+            patch_icpp(i)%fourier_cos(:) = 0._wp
+            patch_icpp(i)%fourier_sin(:) = 0._wp
+            patch_icpp(i)%modal_clip_r_to_min = .false.
+            patch_icpp(i)%modal_r_min = 1.e-12_wp
+            patch_icpp(i)%modal_use_exp_form = .false.
+            patch_icpp(i)%sph_har_coeff(:,:) = 0._wp
 
-            !should get all of r0's and v0's
+            ! should get all of r0's and v0's
             patch_icpp(i)%r0 = dflt_real
             patch_icpp(i)%v0 = dflt_real
 
@@ -400,51 +290,44 @@ contains
             end if
         end do
 
-        ! Tait EOS
-        rhoref = dflt_real
-        pref = dflt_real
+        num_bc_patches = 0
+        bc_io = .false.
 
-        ! Bubble modeling
-        bubbles_euler = .false.
+        do i = 1, num_bc_patches_max
+            patch_bc(i)%geometry = dflt_int
+            patch_bc(i)%type = dflt_int
+            patch_bc(i)%dir = dflt_int
+            patch_bc(i)%loc = dflt_int
+            patch_bc(i)%centroid(:) = dflt_real
+            patch_bc(i)%length(:) = dflt_real
+            patch_bc(i)%radius = dflt_real
+        end do
+
+        ! Bubble modeling (pre-specific)
         polytropic = .true.
-        polydisperse = .false.
-
         thermal = dflt_int
-        R0ref = dflt_real
         nb = dflt_int
 
+        Eu = dflt_real
         Ca = dflt_real
         Re_inv = dflt_real
         Web = dflt_real
-        poly_sigma = dflt_real
-        surface_tension = .false.
 
-        adv_n = .false.
-
-        qbmm = .false.
         nmom = 1
-        sigR = dflt_real
         sigV = dflt_real
         rhoRV = 0._wp
         dist_type = dflt_int
-        R0_type = dflt_int
 
-        R_n = dflt_real
+        R_g = dflt_real
         R_v = dflt_real
-        phi_vn = dflt_real
-        phi_nv = dflt_real
+        phi_vg = dflt_real
+        phi_gv = dflt_real
         Pe_c = dflt_real
         Tw = dflt_real
 
-        ! surface tension modeling
-        sigma = dflt_real
         pi_fac = 1._wp
 
-        ! Immersed Boundaries
-        ib = .false.
-        num_ibs = dflt_int
-
-        do i = 1, num_patches_max
+        do i = 1, num_ib_patches_max_namelist
             patch_ib(i)%geometry = dflt_int
             patch_ib(i)%x_centroid = dflt_real
             patch_ib(i)%y_centroid = dflt_real
@@ -453,275 +336,173 @@ contains
             patch_ib(i)%length_y = dflt_real
             patch_ib(i)%length_z = dflt_real
             patch_ib(i)%radius = dflt_real
-            patch_ib(i)%theta = dflt_real
-            patch_ib(i)%c = dflt_real
-            patch_ib(i)%t = dflt_real
-            patch_ib(i)%m = dflt_real
-            patch_ib(i)%p = dflt_real
+            patch_ib(i)%airfoil_id = 0
+            patch_ib(i)%model_id = 0
             patch_ib(i)%slip = .false.
+            patch_ib(i)%v_blow = 0._wp
+            patch_ib(i)%inj_species = 0
+            patch_ib(i)%burn_rate_exp = 0._wp
+            patch_ib(i)%burn_rate_pref = 0._wp
 
-            ! Proper default values for translating STL models
-            patch_ib(i)%model_scale(:) = 1._wp
-            patch_ib(i)%model_translate(:) = 0._wp
-            patch_ib(i)%model_rotate(:) = 0._wp
-            patch_ib(i)%model_filepath(:) = dflt_char
-            patch_ib(i)%model_spc = num_ray
-            patch_ib(i)%model_threshold = ray_tracing_threshold
+            ! Variables to handle moving immersed boundaries, defaulting to no movement
+            patch_ib(i)%moving_ibm = 0
+            patch_ib(i)%vel(:) = 0._wp
+            patch_ib(i)%angles(:) = 0._wp
+            patch_ib(i)%angular_vel(:) = 0._wp
+            patch_ib(i)%kin_model = 0
+            patch_ib(i)%kin_hinge(:) = 0._wp
+            patch_ib(i)%kin_offset(:) = 0._wp
+            patch_ib(i)%kin_phi0 = 0._wp
+            patch_ib(i)%kin_theta0 = 0._wp
+            patch_ib(i)%kin_theta_mean = 0._wp
+            patch_ib(i)%kin_freq = 0._wp
+            patch_ib(i)%kin_phase = 0._wp
+            patch_ib(i)%kin_t0 = 0._wp
+            patch_ib(i)%kin_ramp = 0._wp
+            patch_ib(i)%kin_pitch_rate = 0._wp
+            patch_ib(i)%kin_smooth = 0._wp
+            patch_ib(i)%mass = dflt_real
+            patch_ib(i)%moment = dflt_real
+            patch_ib(i)%centroid_offset(:) = 0._wp
+
+            ! sets values of a rotation matrix which can be used when calculating rotations
+            patch_ib(i)%rotation_matrix = 0._wp
+            patch_ib(i)%rotation_matrix(1, 1) = 1._wp
+            patch_ib(i)%rotation_matrix(2, 2) = 1._wp
+            patch_ib(i)%rotation_matrix(3, 3) = 1._wp
+            patch_ib(i)%rotation_matrix_inverse = patch_ib(i)%rotation_matrix
         end do
+
+        do i = 1, num_ib_airfoils_max
+            ib_airfoil(i)%c = dflt_real
+            ib_airfoil(i)%p = dflt_real
+            ib_airfoil(i)%t = dflt_real
+            ib_airfoil(i)%m = dflt_real
+        end do
+
+        num_stl_models = 0
+
+        do i = 1, num_stl_models_max
+            stl_models(i)%model_filepath(:) = dflt_char
+            stl_models(i)%model_translate(:) = 0._wp
+            stl_models(i)%model_scale(:) = 1._wp
+            stl_models(i)%model_threshold = ray_tracing_threshold
+        end do
+
+        chem_params%gamma_method = 1
+        chem_params%transport_model = 1
+
+        chem_params%reaction_substeps = 0
+        chem_params%adap_substeps = .false.
+        chem_params%reaction_substeps_max = 0
 
         ! Fluids physical parameters
         do i = 1, num_fluids_max
+            fluid_pp(i)%eos = eos_stiffened_gas
+            fluid_pp(i)%mg_rho0 = dflt_real
+            fluid_pp(i)%mg_c0 = dflt_real
+            fluid_pp(i)%mg_s = dflt_real
+            fluid_pp(i)%mg_gruneisen = dflt_real
+            fluid_pp(i)%mg_gruneisen_a = 0._wp
+            fluid_pp(i)%mg_t0 = 0._wp
+            fluid_pp(i)%mg_s2 = 0._wp
+            fluid_pp(i)%mg_s3 = 0._wp
+            fluid_pp(i)%jwl_a = dflt_real
+            fluid_pp(i)%jwl_b = dflt_real
+            fluid_pp(i)%jwl_r1 = dflt_real
+            fluid_pp(i)%jwl_r2 = dflt_real
+            fluid_pp(i)%jwl_omega = dflt_real
+            fluid_pp(i)%jwl_rho0 = dflt_real
+            fluid_pp(i)%jwl_t0 = 0._wp
+            fluid_pp(i)%vinet_k0 = dflt_real
+            fluid_pp(i)%vinet_k0p = dflt_real
+            fluid_pp(i)%vinet_rho0 = dflt_real
+            fluid_pp(i)%vinet_gruneisen = dflt_real
+            fluid_pp(i)%vinet_gruneisen_a = 0._wp
+            fluid_pp(i)%vinet_t0 = 0._wp
             fluid_pp(i)%gamma = dflt_real
             fluid_pp(i)%pi_inf = dflt_real
-            fluid_pp(i)%mul0 = dflt_real
-            fluid_pp(i)%ss = dflt_real
-            fluid_pp(i)%pv = dflt_real
-            fluid_pp(i)%gamma_v = dflt_real
-            fluid_pp(i)%M_v = dflt_real
-            fluid_pp(i)%mu_v = dflt_real
-            fluid_pp(i)%k_v = dflt_real
             fluid_pp(i)%cv = 0._wp
             fluid_pp(i)%qv = 0._wp
             fluid_pp(i)%qvp = 0._wp
             fluid_pp(i)%G = 0._wp
+            fluid_pp(i)%non_newtonian = .false.
+            fluid_pp(i)%K = dflt_real
+            fluid_pp(i)%nn = dflt_real
+            fluid_pp(i)%tau0 = 0._wp
+            fluid_pp(i)%hb_m = dflt_real
+            fluid_pp(i)%mu_min = dflt_real
+            fluid_pp(i)%mu_max = dflt_real
+            fluid_pp(i)%mu_bulk = dflt_real
         end do
 
-        ! Lagrangian solver
-        rkck_adap_dt = .false.
+        ! Subgrid bubble parameters
+        bub_pp%R0ref = dflt_real; R0ref = dflt_real
+        bub_pp%p0ref = dflt_real; p0ref = dflt_real
+        bub_pp%rho0ref = dflt_real; rho0ref = dflt_real
+        bub_pp%T0ref = dflt_real; T0ref = dflt_real
+        bub_pp%ss = dflt_real; ss = dflt_real
+        bub_pp%pv = dflt_real; pv = dflt_real
+        bub_pp%vd = dflt_real; vd = dflt_real
+        bub_pp%mu_l = dflt_real; mu_l = dflt_real
+        bub_pp%mu_v = dflt_real; mu_v = dflt_real
+        bub_pp%mu_g = dflt_real; mu_g = dflt_real
+        bub_pp%gam_v = dflt_real; gam_v = dflt_real
+        bub_pp%gam_g = dflt_real; gam_g = dflt_real
+        bub_pp%M_v = dflt_real; M_v = dflt_real
+        bub_pp%M_g = dflt_real; M_g = dflt_real
+        bub_pp%k_v = dflt_real
+        bub_pp%k_g = dflt_real
+        bub_pp%cp_v = dflt_real; cp_v = dflt_real
+        bub_pp%cp_g = dflt_real; cp_g = dflt_real
+        bub_pp%R_v = dflt_real; R_v = dflt_real
+        bub_pp%R_g = dflt_real; R_g = dflt_real
 
     end subroutine s_assign_default_values_to_user_inputs
 
-    !> Computation of parameters, allocation procedures, and/or
-        !! any other tasks needed to properly setup the module
-    subroutine s_initialize_global_parameters_module
+    !> Computation of parameters, allocation procedures, and/or any other tasks needed to properly setup the module
+    impure subroutine s_initialize_global_parameters_module
 
         integer :: i, j, fac
 
-        ! Determining the layout of the state vectors and overall size of
-        ! the system of equations, given the dimensionality and choice of
-        ! the equations of motion
+        if (recon_type == recon_type_weno) then
+            weno_polyn = (weno_order - 1)/2
+        else if (recon_type == recon_type_muscl) then
+            muscl_polyn = muscl_order
+        end if
 
-        ! Gamma/Pi_inf Model
-        if (model_eqns == 1) then
+        ! Gamma/Pi_inf: force num_fluids=1 (pre_process-specific side effect of the gamma-law model)
+        if (model_eqns == model_eqns_gamma_law) num_fluids = 1
 
-            ! Setting number of fluids
-            num_fluids = 1
+        ! Pre-process sets nmom to 6 for qbmm before the shared eqn_idx setup
+        ! (guards match the original site: 5-equation bubbles with 4-node qbmm)
+        if (model_eqns == model_eqns_5eq .and. bubbles_euler .and. qbmm .and. nnode == 4) nmom = 6
 
-            ! Annotating structure of the state and flux vectors belonging
-            ! to the system of equations defined by the selected number of
-            ! spatial dimensions and the gamma/pi_inf model
-            cont_idx%beg = 1
-            cont_idx%end = cont_idx%beg
-            mom_idx%beg = cont_idx%end + 1
-            mom_idx%end = cont_idx%end + num_dims
-            E_idx = mom_idx%end + 1
-            adv_idx%beg = E_idx + 1
-            adv_idx%end = adv_idx%beg + 1
-            gamma_idx = adv_idx%beg
-            pi_inf_idx = adv_idx%end
-            sys_size = adv_idx%end
+        ! Populate eqn_idx, sys_size, shear_* (shared logic)
+        call s_initialize_eqn_idx(nmom, nb, six_eqn_alf_is_advected=.false.)
 
-            ! Volume Fraction Model (5-equation model)
-        else if (model_eqns == 2) then
+        ! Per-target (pre_process): qbmm_idx allocations and fills
+        if (model_eqns == model_eqns_5eq .and. bubbles_euler) then
+            allocate (qbmm_idx%rs(nb), qbmm_idx%vs(nb))
+            allocate (qbmm_idx%ps(nb), qbmm_idx%ms(nb))
 
-            ! Annotating structure of the state and flux vectors belonging
-            ! to the system of equations defined by the selected number of
-            ! spatial dimensions and the volume fraction model
-            cont_idx%beg = 1
-            cont_idx%end = num_fluids
-            mom_idx%beg = cont_idx%end + 1
-            mom_idx%end = cont_idx%end + num_dims
-            E_idx = mom_idx%end + 1
-            adv_idx%beg = E_idx + 1
-            adv_idx%end = E_idx + num_fluids
+            if (qbmm) then
+                allocate (qbmm_idx%moms(nb, nmom))
+                allocate (qbmm_idx%fullmom(nb,0:nmom,0:nmom))
 
-            sys_size = adv_idx%end
-
-            if (bubbles_euler) then
-                alf_idx = adv_idx%end
+                do i = 1, nb
+                    do j = 1, nmom
+                        qbmm_idx%moms(i, j) = eqn_idx%bub%beg + (j - 1) + (i - 1)*nmom
+                    end do
+                    qbmm_idx%fullmom(i, 0, 0) = qbmm_idx%moms(i, 1)
+                    qbmm_idx%fullmom(i, 1, 0) = qbmm_idx%moms(i, 2)
+                    qbmm_idx%fullmom(i, 0, 1) = qbmm_idx%moms(i, 3)
+                    qbmm_idx%fullmom(i, 2, 0) = qbmm_idx%moms(i, 4)
+                    qbmm_idx%fullmom(i, 1, 1) = qbmm_idx%moms(i, 5)
+                    qbmm_idx%fullmom(i, 0, 2) = qbmm_idx%moms(i, 6)
+                    qbmm_idx%rs(i) = qbmm_idx%fullmom(i, 1, 0)
+                end do
             else
-                alf_idx = 1
-            end if
-
-            if (bubbles_euler) then
-                bub_idx%beg = sys_size + 1
-                if (qbmm) then
-                    if (nnode == 4) then
-                        nmom = 6 !! Already set as a parameter
-                    end if
-                    bub_idx%end = adv_idx%end + nb*nmom
-                else
-                    if (.not. polytropic) then
-                        bub_idx%end = sys_size + 4*nb
-                    else
-                        bub_idx%end = sys_size + 2*nb
-                    end if
-                end if
-                sys_size = bub_idx%end
-
-                if (adv_n) then
-                    n_idx = bub_idx%end + 1
-                    sys_size = n_idx
-                end if
-
-                allocate (weight(nb), R0(nb), V0(nb))
-                allocate (bub_idx%rs(nb), bub_idx%vs(nb))
-                allocate (bub_idx%ps(nb), bub_idx%ms(nb))
-
-                if (qbmm) then
-                    allocate (bub_idx%moms(nb, nmom))
-                    allocate (bub_idx%fullmom(nb, 0:nmom, 0:nmom))
-
-                    do i = 1, nb
-                        do j = 1, nmom
-                            bub_idx%moms(i, j) = bub_idx%beg + (j - 1) + (i - 1)*nmom
-                        end do
-                        bub_idx%fullmom(i, 0, 0) = bub_idx%moms(i, 1)
-                        bub_idx%fullmom(i, 1, 0) = bub_idx%moms(i, 2)
-                        bub_idx%fullmom(i, 0, 1) = bub_idx%moms(i, 3)
-                        bub_idx%fullmom(i, 2, 0) = bub_idx%moms(i, 4)
-                        bub_idx%fullmom(i, 1, 1) = bub_idx%moms(i, 5)
-                        bub_idx%fullmom(i, 0, 2) = bub_idx%moms(i, 6)
-                        bub_idx%rs(i) = bub_idx%fullmom(i, 1, 0)
-                    end do
-                else
-                    do i = 1, nb
-                        if (.not. polytropic) then
-                            fac = 4
-                        else
-                            fac = 2
-                        end if
-
-                        bub_idx%rs(i) = bub_idx%beg + (i - 1)*fac
-                        bub_idx%vs(i) = bub_idx%rs(i) + 1
-
-                        if (.not. polytropic) then
-                            bub_idx%ps(i) = bub_idx%vs(i) + 1
-                            bub_idx%ms(i) = bub_idx%ps(i) + 1
-                        end if
-                    end do
-                end if
-
-                if (nb == 1) then
-                    weight(:) = 1._wp
-                    R0(:) = 1._wp
-                    V0(:) = 1._wp
-                else if (nb > 1) then
-                    V0(:) = 1._wp
-                    !R0 and weight initialized in s_simpson
-                else
-                    stop 'Invalid value of nb'
-                end if
-
-                !Initialize pref,rhoref for polytropic qbmm (done in s_initialize_nonpoly for non-polytropic)
-                if (.not. qbmm) then
-                    if (polytropic) then
-                        rhoref = 1._wp
-                        pref = 1._wp
-                    end if
-                end if
-
-                !Initialize pb0,pv,pref,rhoref for polytropic qbmm (done in s_initialize_nonpoly for non-polytropic)
-                if (qbmm) then
-                    if (polytropic) then
-                        allocate (pb0(nb))
-                        if ((f_is_default(Web))) then
-                            pb0 = pref
-                            pb0 = pb0/pref
-                            pref = 1._wp
-                        end if
-                        rhoref = 1._wp
-                    end if
-                end if
-            end if
-
-            if (hypoelasticity .or. hyperelasticity) then
-                elasticity = .true.
-                stress_idx%beg = sys_size + 1
-                stress_idx%end = sys_size + (num_dims*(num_dims + 1))/2
-                ! number of stresses is 1 in 1D, 3 in 2D, 6 in 3D
-                sys_size = stress_idx%end
-            end if
-
-            if (hyperelasticity) then
-                ! number of entries in the symmetric btensor plus the jacobian
-                b_size = (num_dims*(num_dims + 1))/2 + 1
-                tensor_size = num_dims**2 + 1
-                xi_idx%beg = sys_size + 1
-                xi_idx%end = sys_size + num_dims
-                ! adding three more equations for the \xi field and the elastic energy
-                sys_size = xi_idx%end + 1
-            end if
-
-            if (surface_tension) then
-                c_idx = sys_size + 1
-                sys_size = c_idx
-            end if
-
-            ! Volume Fraction Model (6-equation model)
-        else if (model_eqns == 3) then
-
-            ! Annotating structure of the state and flux vectors belonging
-            ! to the system of equations defined by the selected number of
-            ! spatial dimensions and the volume fraction model
-            cont_idx%beg = 1
-            cont_idx%end = num_fluids
-            mom_idx%beg = cont_idx%end + 1
-            mom_idx%end = cont_idx%end + num_dims
-            E_idx = mom_idx%end + 1
-            adv_idx%beg = E_idx + 1
-            adv_idx%end = E_idx + num_fluids
-            internalEnergies_idx%beg = adv_idx%end + 1
-            internalEnergies_idx%end = adv_idx%end + num_fluids
-            sys_size = internalEnergies_idx%end
-
-            if (hypoelasticity .or. hyperelasticity) then
-                elasticity = .true.
-                stress_idx%beg = sys_size + 1
-                stress_idx%end = sys_size + (num_dims*(num_dims + 1))/2
-                ! number of stresses is 1 in 1D, 3 in 2D, 6 in 3D
-                sys_size = stress_idx%end
-            end if
-
-            if (hyperelasticity) then
-                ! number of entries in the symmetric btensor plus the jacobian
-                b_size = (num_dims*(num_dims + 1))/2 + 1
-                tensor_size = num_dims**2 + 1
-                xi_idx%beg = sys_size + 1
-                xi_idx%end = sys_size + num_dims
-                ! adding three more equations for the \xi field and the elastic energy
-                sys_size = xi_idx%end + 1
-            end if
-
-            if (surface_tension) then
-                c_idx = sys_size + 1
-                sys_size = c_idx
-            end if
-
-        else if (model_eqns == 4) then
-            ! 4 equation model with subgrid bubbles_euler
-            cont_idx%beg = 1 ! one continuity equation
-            cont_idx%end = 1 ! num_fluids
-            mom_idx%beg = cont_idx%end + 1 ! one momentum equation in each direction
-            mom_idx%end = cont_idx%end + num_dims
-            E_idx = mom_idx%end + 1 ! one energy equation
-            adv_idx%beg = E_idx + 1
-            adv_idx%end = adv_idx%beg !one volume advection equation
-            alf_idx = adv_idx%end
-            sys_size = alf_idx !adv_idx%end
-
-            if (bubbles_euler) then
-                bub_idx%beg = sys_size + 1
-                bub_idx%end = sys_size + 2*nb
-                if (.not. polytropic) then
-                    bub_idx%end = sys_size + 4*nb
-                end if
-                sys_size = bub_idx%end
-
-                allocate (bub_idx%rs(nb), bub_idx%vs(nb))
-                allocate (bub_idx%ps(nb), bub_idx%ms(nb))
-                allocate (weight(nb), R0(nb), V0(nb))
-
                 do i = 1, nb
                     if (.not. polytropic) then
                         fac = 4
@@ -729,88 +510,42 @@ contains
                         fac = 2
                     end if
 
-                    bub_idx%rs(i) = bub_idx%beg + (i - 1)*fac
-                    bub_idx%vs(i) = bub_idx%rs(i) + 1
+                    qbmm_idx%rs(i) = eqn_idx%bub%beg + (i - 1)*fac
+                    qbmm_idx%vs(i) = qbmm_idx%rs(i) + 1
 
                     if (.not. polytropic) then
-                        bub_idx%ps(i) = bub_idx%vs(i) + 1
-                        bub_idx%ms(i) = bub_idx%ps(i) + 1
+                        qbmm_idx%ps(i) = qbmm_idx%vs(i) + 1
+                        qbmm_idx%ms(i) = qbmm_idx%ps(i) + 1
                     end if
                 end do
-
-                if (nb == 1) then
-                    weight(:) = 1._wp
-                    R0(:) = 1._wp
-                    V0(:) = 0._wp
-                else if (nb > 1) then
-                    V0(:) = 1._wp
-                else
-                    stop 'Invalid value of nb'
-                end if
-
-                if (polytropic) then
-                    rhoref = 1._wp
-                    pref = 1._wp
-                end if
-
             end if
         end if
 
-        if (chemistry) then
-            species_idx%beg = sys_size + 1
-            species_idx%end = sys_size + num_species
-            sys_size = species_idx%end
-        end if
+        if (bubbles_lagrange) fd_number = max(1, fd_order/2)
 
-        momxb = mom_idx%beg
-        momxe = mom_idx%end
-        advxb = adv_idx%beg
-        advxe = adv_idx%end
-        contxb = cont_idx%beg
-        contxe = cont_idx%end
-        bubxb = bub_idx%beg
-        bubxe = bub_idx%end
-        strxb = stress_idx%beg
-        strxe = stress_idx%end
-        intxb = internalEnergies_idx%beg
-        intxe = internalEnergies_idx%end
-        xibeg = xi_idx%beg
-        xiend = xi_idx%end
-        chemxb = species_idx%beg
-        chemxe = species_idx%end
-
-        ! Configuring Coordinate Direction Indexes
-        idwint(1)%beg = 0; idwint(2)%beg = 0; idwint(3)%beg = 0
-        idwint(1)%end = m; idwint(2)%end = n; idwint(3)%end = p
-
-        ! There is no buffer region in pre_process.
-        idwbuff(1) = idwint(1); idwbuff(2) = idwint(2); idwbuff(3) = idwint(3)
+        call s_configure_coordinate_bounds(recon_type, weno_polyn, muscl_polyn, igr_order, buff_size, idwint, idwbuff, viscous, &
+                                           & bubbles_lagrange, m, n, p, num_dims, igr, ib, fd_number)
 
 #ifdef MFC_MPI
-
         if (qbmm .and. .not. polytropic) then
-            allocate (MPI_IO_DATA%view(1:sys_size + 2*nb*4))
-            allocate (MPI_IO_DATA%var(1:sys_size + 2*nb*4))
+            allocate (MPI_IO_DATA%view(1:sys_size + 2*nb*nnode))
+            allocate (MPI_IO_DATA%var(1:sys_size + 2*nb*nnode))
         else
             allocate (MPI_IO_DATA%view(1:sys_size))
             allocate (MPI_IO_DATA%var(1:sys_size))
         end if
 
-        do i = 1, sys_size
-            allocate (MPI_IO_DATA%var(i)%sf(0:m, 0:n, 0:p))
-            MPI_IO_DATA%var(i)%sf => null()
-        end do
-        if (qbmm .and. .not. polytropic) then
-            do i = sys_size + 1, sys_size + 2*nb*4
-                allocate (MPI_IO_DATA%var(i)%sf(0:m, 0:n, 0:p))
+        if (.not. down_sample) then
+            do i = 1, sys_size
+                allocate (MPI_IO_DATA%var(i)%sf(0:m,0:n,0:p))
                 MPI_IO_DATA%var(i)%sf => null()
             end do
         end if
-
-        if (ib) then
-            allocate (MPI_IO_IB_DATA%var%sf(0:m, 0:n, 0:p))
-            allocate (MPI_IO_levelset_DATA%var%sf(0:m, 0:n, 0:p, 1:num_ibs))
-            allocate (MPI_IO_levelsetnorm_DATA%var%sf(0:m, 0:n, 0:p, 1:num_ibs, 1:3))
+        if (qbmm .and. .not. polytropic) then
+            do i = sys_size + 1, sys_size + 2*nb*nnode
+                allocate (MPI_IO_DATA%var(i)%sf(0:m,0:n,0:p))
+                MPI_IO_DATA%var(i)%sf => null()
+            end do
         end if
 #endif
 
@@ -824,48 +559,36 @@ contains
             end if
         end if
 
-        if (cyl_coord .neqv. .true.) then ! Cartesian grid
+        if (cyl_coord .neqv. .true.) then  ! Cartesian grid
             grid_geometry = 1
-        elseif (cyl_coord .and. p == 0) then ! Axisymmetric cylindrical grid
+        else if (cyl_coord .and. p == 0) then  ! Axisymmetric cylindrical grid
             grid_geometry = 2
-        else ! Fully 3D cylindrical grid
+        else  ! Fully 3D cylindrical grid
             grid_geometry = 3
         end if
 
-        allocate (logic_grid(0:m, 0:n, 0:p))
+        if (.not. igr) then
+            allocate (logic_grid(0:m,0:n,0:p))
+        end if
 
     end subroutine s_initialize_global_parameters_module
 
-    subroutine s_initialize_parallel_io
+    !> Configure MPI parallel I/O settings and allocate processor coordinate arrays.
+    impure subroutine s_initialize_parallel_io
 
-        num_dims = 1 + min(1, n) + min(1, p)
-
-        allocate (proc_coords(1:num_dims))
-
-        if (parallel_io .neqv. .true.) return
-
-#ifdef MFC_MPI
-
-        ! Option for Lustre file system (Darter/Comet/Stampede)
-        write (mpiiofs, '(A)') '/lustre_'
-        mpiiofs = trim(mpiiofs)
-        call MPI_INFO_CREATE(mpi_info_int, ierr)
-        call MPI_INFO_SET(mpi_info_int, 'romio_ds_write', 'disable', ierr)
-
-        ! Option for UNIX file system (Hooke/Thomson)
-        ! WRITE(mpiiofs, '(A)') '/ufs_'
-        ! mpiiofs = TRIM(mpiiofs)
-        ! mpi_info_int = MPI_INFO_NULL
-
-        allocate (start_idx(1:num_dims))
-
-#endif
+        call s_initialize_parallel_io_common
 
     end subroutine s_initialize_parallel_io
 
-    subroutine s_finalize_global_parameters_module
+    !> Deallocate all global grid, index, and equation-of-state parameter arrays.
+    impure subroutine s_finalize_global_parameters_module
 
         integer :: i
+
+        if (bubbles_euler) then
+            deallocate (qbmm_idx%rs, qbmm_idx%vs, qbmm_idx%ps, qbmm_idx%ms)
+            if (qbmm) deallocate (qbmm_idx%moms, qbmm_idx%fullmom)
+        end if
 
         ! Deallocating grid variables for the x-direction
         deallocate (x_cc, x_cb)
@@ -877,12 +600,11 @@ contains
             end if
         end if
 
-        deallocate (proc_coords)
+        ! Shared: deallocate proc_coords and start_idx
+        call s_finalize_global_parameters_common
 
 #ifdef MFC_MPI
-
         if (parallel_io) then
-            deallocate (start_idx)
             do i = 1, sys_size
                 MPI_IO_DATA%var(i)%sf => null()
             end do
@@ -890,10 +612,9 @@ contains
             deallocate (MPI_IO_DATA%var)
             deallocate (MPI_IO_DATA%view)
         end if
-
-        if (ib) deallocate (MPI_IO_IB_DATA%var%sf)
-
 #endif
+
+        if (allocated(neighbor_ranks)) deallocate (neighbor_ranks)
 
     end subroutine s_finalize_global_parameters_module
 

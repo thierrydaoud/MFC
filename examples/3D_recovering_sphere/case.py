@@ -2,18 +2,18 @@
 # This simulation shows the early stages of a cubic droplet recovering a spherical shape due to capillary
 # forces. While the relaxation is not complete, it demonstrates the expecteed symmetric behavior.
 
-import math
 import json
+import math
 
 l = 0.375
 
 # Numerical setup
 r0 = 0.15
-x0 = 0
+x0 = 0.0
 x1 = l
-y0 = 0
+y0 = 0.0
 y1 = l
-z0 = 0
+z0 = 0.0
 z1 = l
 
 
@@ -44,23 +44,23 @@ data = {
     "t_step_start": 400000,
     "t_step_stop": 1000000,
     "t_step_save": 2000,
-    #'t_step_stop'       : 100,
-    #'t_step_save'       : 100,
+    # 't_step_stop'       : 100,
+    # 't_step_save'       : 100,
     # Simulation Algorithm
-    "model_eqns": 3,
+    "model_eqns": "6eq",
     "alt_soundspeed": "F",
     "mixture_err": "T",
     "mpp_lim": "F",
-    "time_stepper": 3,
+    "time_stepper": "rk3",
     "weno_order": 3,
-    "avg_state": 2,
+    "avg_state": "arithmetic",
     "weno_eps": 1e-16,
     "mapped_weno": "T",
     "null_weights": "F",
     "mp_weno": "F",
     "weno_Re_flux": "F",
-    "riemann_solver": 2,
-    "wave_speeds": 1,
+    "riemann_solver": "hllc",
+    "wave_speeds": "direct",
     "bc_x%beg": -2,
     "bc_x%end": -3,
     "bc_y%beg": -2,
@@ -72,8 +72,8 @@ data = {
     "weno_avg": "T",
     "surface_tension": "T",
     # Database Structure Parameters
-    "format": 1,
-    "precision": 2,
+    "format": "silo",
+    "precision": "double",
     "alpha_wrt(1)": "T",
     # 'prim_vars_wrt'     : 'T',
     "cf_wrt": "T",
@@ -81,10 +81,11 @@ data = {
     "sigma": 8.0,
     # Fluid Parameters (Water)
     "fluid_pp(1)%gamma": 1.0e00 / (2.1e00 - 1.0e00),
+    "fluid_pp(1)%eos": "stiffened_gas",
     "fluid_pp(1)%pi_inf": 2.1e00 * 1.0e06 / (2.1e00 - 1.0e00),
     # Fluid Parameters (Gas)
     "fluid_pp(2)%gamma": 1.0e00 / (1.4e00 - 1.0e00),
-    "fluid_pp(2)%pi_inf": 0.0e00,
+    "fluid_pp(2)%eos": "ideal_gas",
     # Air Patch
     "patch_icpp(1)%geometry": 9,
     "patch_icpp(1)%x_centroid": 0,

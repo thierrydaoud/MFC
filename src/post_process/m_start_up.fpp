@@ -1,0 +1,1009 @@
+#:include 'macros.fpp'
+
+!>
+!! @file
+!! @brief  Contains module m_start_up
+
+!> @brief Reads and validates user inputs, allocates variables, and configures MPI decomposition and I/O for post-processing
+
+module m_start_up
+
+    use, intrinsic :: iso_c_binding
+
+    use m_derived_types
+    use m_global_parameters
+    use m_mpi_proxy
+    use m_mpi_common
+    use m_boundary_common
+    use m_boundary_io
+    use m_variables_conversion
+    use m_data_input
+    use m_data_output
+    use m_derived_variables
+    use m_helper
+    use m_compile_specific
+    use m_checker_common
+    use m_checker
+    use m_thermochem, only: num_species, species_names
+    use m_finite_differences
+    use m_constants, only: model_eqns_gamma_law, model_eqns_5eq, model_eqns_6eq, format_silo
+    use m_chemistry
+
+#ifdef MFC_MPI
+    use mpi
+#endif
+
+    implicit none
+
+    include 'fftw3.f03'
+
+    type(c_ptr)                             :: fwd_plan_x, fwd_plan_y, fwd_plan_z
+    complex(c_double_complex), allocatable  :: data_in(:), data_out(:)
+    complex(c_double_complex), allocatable  :: data_cmplx(:,:,:), data_cmplx_y(:,:,:), data_cmplx_z(:,:,:)
+    real(wp), allocatable, dimension(:,:,:) :: En_real
+    real(wp), allocatable, dimension(:)     :: En
+    integer                                 :: Nx, Ny, Nz, Nxloc, Nyloc, Nyloc2, Nzloc, Nf
+    integer                                 :: ierr
+    integer                                 :: MPI_COMM_CART, MPI_COMM_CART12, MPI_COMM_CART13
+    integer, dimension(3)                   :: cart3d_coords
+    integer, dimension(2)                   :: cart2d12_coords, cart2d13_coords
+    integer                                 :: proc_rank12, proc_rank13
+
+contains
+
+    !> Reads the configuration file post_process.inp, in order to populate parameters in module m_global_parameters.f90 with the
+    !! user provided inputs
+    impure subroutine s_read_input_file
+
+        character(LEN=name_len) :: file_loc
+        logical                 :: file_check
+        integer                 :: iostatus
+        character(len=1000)     :: line
+
+        #:include 'generated_namelist.fpp'
+
+        file_loc = 'post_process.inp'
+        inquire (FILE=trim(file_loc), EXIST=file_check)
+
+        if (file_check) then
+            open (1, FILE=trim(file_loc), form='formatted', STATUS='old', ACTION='read')
+            read (1, NML=user_inputs, iostat=iostatus)
+
+            if (iostatus /= 0) then
+                backspace (1)
+                read (1, fmt='(A)') line
+                print *, 'Invalid line in namelist: ' // trim(line)
+                call s_mpi_abort('Invalid line in post_process.inp. It is ' // 'likely due to a datatype mismatch. Exiting.')
+            end if
+
+            close (1)
+
+            call s_update_cell_bounds(cells_bounds, m, n, p)
+
+            if (down_sample) then
+                m = int((m + 1)/3) - 1
+                n = int((n + 1)/3) - 1
+                p = int((p + 1)/3) - 1
+            end if
+
+            m_glb = m
+            n_glb = n
+            p_glb = p
+
+            nGlobal = int(m_glb + 1, kind=8)*int(n_glb + 1, kind=8)*int(p_glb + 1, kind=8)
+
+            if (cfl_adap_dt .or. cfl_const_dt) cfl_dt = .true.
+
+            if (any((/bc_x%beg, bc_x%end, bc_y%beg, bc_y%end, bc_z%beg, bc_z%end/) == -17) .or. num_bc_patches > 0) then
+                bc_io = .true.
+            end if
+        else
+            call s_mpi_abort('File post_process.inp is missing. Exiting.')
+        end if
+
+    end subroutine s_read_input_file
+
+    !> Checking that the user inputs make sense, i.e. that the individual choices are compatible with the code's options and that
+    !! the combination of these choices results into a valid configuration for the post-process
+    impure subroutine s_check_input_file
+
+        character(LEN=len_trim(case_dir)) :: file_loc
+        logical                           :: dir_check
+
+        case_dir = adjustl(case_dir)
+
+        file_loc = trim(case_dir) // '/.'
+
+        call my_inquire(file_loc, dir_check)
+
+        if (dir_check .neqv. .true.) then
+            call s_mpi_abort('Unsupported choice for the value of ' // 'case_dir. Exiting.')
+        end if
+
+        call s_check_inputs_common(check_total_cells=.true., n_global=nGlobal)
+        call s_check_inputs()
+
+    end subroutine s_check_input_file
+
+    !> Load grid and conservative data for a time step, fill ghost-cell buffers, and convert to primitive variables.
+    impure subroutine s_perform_time_step(t_step)
+
+        integer, intent(inout) :: t_step
+        integer                :: eta_hh, eta_mm, eta_ss
+        real(wp)               :: eta_sec
+
+        if (proc_rank == 0) then
+            if (cfl_dt) then
+                eta_sec = wall_time_avg*real(n_save - 1 - t_step, wp)
+                eta_hh = int(eta_sec)/3600
+                eta_mm = mod(int(eta_sec), 3600)/60
+                eta_ss = mod(int(eta_sec), 60)
+                print '(" [", I3, "%] Saving ", I0, " of ", I0, " t/step ", ES9.2, "s (avg ", ES9.2, "s) ETA ", I0, ":", I2.2, ":", I2.2)', &
+                    & int(ceiling(100._wp*(real(t_step - n_start)/(n_save)))), t_step, n_save, wall_time, wall_time_avg, eta_hh, &
+                    & eta_mm, eta_ss
+            else
+                eta_sec = wall_time_avg*real((t_step_stop - t_step)/t_step_save, wp)
+                eta_hh = int(eta_sec)/3600
+                eta_mm = mod(int(eta_sec), 3600)/60
+                eta_ss = mod(int(eta_sec), 60)
+                print '(" [", I3, "%] Saving ", I0, " of ", I0, " (t_step ", I0, ") t/step ", ES9.2, "s (avg ", ES9.2, "s) ETA ", I0, ":", I2.2, ":", I2.2)', &
+                    & int(ceiling(100._wp*(real(t_step - t_step_start)/(t_step_stop - t_step_start + 1)))), &
+                    & (t_step - t_step_start)/t_step_save + 1, (t_step_stop - t_step_start)/t_step_save + 1, t_step, wall_time, &
+                    & wall_time_avg, eta_hh, eta_mm, eta_ss
+            end if
+        end if
+
+        call s_read_data_files(t_step)
+
+        ! seed the chemistry temperature over the INTERIOR only (mirrors the simulation,
+        ! m_start_up): the ghost q_cons is unread at this point, so a ghost-inclusive sweep
+        ! would Newton-iterate on garbage (NaN under NaN-init builds) at rank seams and
+        ! physical boundaries; s_populate_variables_buffers below extends q_T into the ghosts
+        if (chemistry) call s_compute_q_T_sf(q_T_sf, q_cons_vf, idwint)
+
+        if (buff_size > 0) then
+            if (n == 0) then
+                call s_populate_grid_variables_buffers(x_cb, x_cc, dx, offset_x, offset_y, offset_z)
+            else if (p == 0) then
+                call s_populate_grid_variables_buffers(x_cb, x_cc, dx, offset_x, offset_y, offset_z, y_cb, y_cc, dy)
+            else
+                call s_populate_grid_variables_buffers(x_cb, x_cc, dx, offset_x, offset_y, offset_z, y_cb, y_cc, dy, z_cb, z_cc, dz)
+            end if
+            call s_populate_variables_buffers(bc_type, q_cons_vf, q_T_sf=q_T_sf)
+        end if
+
+        call s_convert_conservative_to_primitive_variables(q_cons_vf, q_T_sf, q_prim_vf, idwbuff)
+
+    end subroutine s_perform_time_step
+
+    !> Derive requested flow quantities from primitive variables and write them to the formatted database files.
+    impure subroutine s_save_data(t_step, varname, pres, c)
+
+        integer, intent(inout)                 :: t_step
+        character(LEN=name_len), intent(inout) :: varname
+        real(wp), intent(inout)                :: pres, c
+
+        real(wp), dimension(-offset_x%beg:m + offset_x%end,-offset_y%beg:n + offset_y%end, &
+             & -offset_z%beg:p + offset_z%end) :: liutex_mag
+        real(wp), dimension(-offset_x%beg:m + offset_x%end,-offset_y%beg:n + offset_y%end,-offset_z%beg:p + offset_z%end, &
+             & 3) :: liutex_axis
+        integer                         :: i, j, k, l, kx, ky, kz, kf, j_glb, k_glb, l_glb
+        character(50)                   :: filename
+        logical                         :: file_exists
+        real(wp), dimension(num_fluids) :: alpha_rho
+        real(wp)                        :: T
+        integer                         :: x_beg, x_end, y_beg, y_end, z_beg, z_end
+
+        if (output_partial_domain) then
+            call s_define_output_region
+            x_beg = -offset_x%beg + x_output_idx%beg
+            x_end = offset_x%end + x_output_idx%end
+            y_beg = -offset_y%beg + y_output_idx%beg
+            y_end = offset_y%end + y_output_idx%end
+            z_beg = -offset_z%beg + z_output_idx%beg
+            z_end = offset_z%end + z_output_idx%end
+        else
+            x_beg = -offset_x%beg
+            x_end = offset_x%end + m
+            y_beg = -offset_y%beg
+            y_end = offset_y%end + n
+            z_beg = -offset_z%beg
+            z_end = offset_z%end + p
+        end if
+
+        call s_open_formatted_database_file(t_step)
+
+        if (sim_data .and. proc_rank == 0) then
+            call s_open_intf_data_file()
+            call s_open_energy_data_file()
+        end if
+
+        if (sim_data) then
+            call s_write_intf_data_file(q_prim_vf)
+            call s_write_energy_data_file(q_prim_vf, q_cons_vf)
+        end if
+
+        call s_write_grid_to_formatted_database_file(t_step)
+
+        if (omega_wrt(2) .or. omega_wrt(3) .or. qm_wrt .or. liutex_wrt .or. schlieren_wrt) then
+            call s_compute_finite_difference_coefficients(m, x_cc, fd%fd_coeff_x, buff_size, fd_number, fd_order, offset_x)
+        end if
+
+        if (omega_wrt(1) .or. omega_wrt(3) .or. qm_wrt .or. liutex_wrt .or. (n > 0 .and. schlieren_wrt)) then
+            call s_compute_finite_difference_coefficients(n, y_cc, fd%fd_coeff_y, buff_size, fd_number, fd_order, offset_y)
+        end if
+
+        if (omega_wrt(1) .or. omega_wrt(2) .or. qm_wrt .or. liutex_wrt .or. (p > 0 .and. schlieren_wrt)) then
+            call s_compute_finite_difference_coefficients(p, z_cc, fd%fd_coeff_z, buff_size, fd_number, fd_order, offset_z)
+        end if
+
+        if ((model_eqns == model_eqns_5eq) .or. (model_eqns == model_eqns_6eq)) then
+            do i = 1, num_fluids
+                if (alpha_rho_wrt(i) .or. (cons_vars_wrt .or. prim_vars_wrt)) then
+                    write (varname, '(A,I0)') 'alpha_rho', i
+                    call s_write_field(varname, t_step, q_cons_vf(i), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+                end if
+            end do
+        end if
+
+        if ((rho_wrt .or. (model_eqns == model_eqns_gamma_law .and. (cons_vars_wrt .or. prim_vars_wrt))) .and. (.not. relativity)) &
+            & then
+            out%q_sf(:,:,:) = rho_sf(x_beg:x_end,y_beg:y_end,z_beg:z_end)
+            write (varname, '(A)') 'rho'
+            call s_write_field(varname, t_step)
+        end if
+
+        if (relativity .and. (rho_wrt .or. prim_vars_wrt)) then
+            write (varname, '(A)') 'rho'
+            call s_write_field(varname, t_step, q_prim_vf(1), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+        end if
+
+        if (relativity .and. (rho_wrt .or. cons_vars_wrt)) then
+            ! For relativistic flow, conservative and primitive densities are different Hard-coded single-component for now
+            write (varname, '(A)') 'D'
+            call s_write_field(varname, t_step, q_cons_vf(1), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+        end if
+
+        do i = 1, eqn_idx%E - eqn_idx%mom%beg
+            if (mom_wrt(i) .or. cons_vars_wrt) then
+                write (varname, '(A,I0)') 'mom', i
+                call s_write_field(varname, t_step, q_cons_vf(i + eqn_idx%cont%end), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+            end if
+        end do
+
+        do i = 1, eqn_idx%E - eqn_idx%mom%beg
+            if (vel_wrt(i) .or. prim_vars_wrt) then
+                write (varname, '(A,I0)') 'vel', i
+                call s_write_field(varname, t_step, q_prim_vf(i + eqn_idx%cont%end), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+            end if
+        end do
+
+        if (chemistry) then
+            do i = 1, num_species
+                if (chem_wrt_Y(i) .or. prim_vars_wrt) then
+                    write (varname, '(A,A)') 'Y_', trim(species_names(i))
+                    call s_write_field(varname, t_step, q_prim_vf(eqn_idx%species%beg + i - 1), x_beg, x_end, y_beg, y_end, &
+                                       & z_beg, z_end)
+                end if
+            end do
+
+            if (chem_wrt_T) then
+                out%q_sf(:,:,:) = q_T_sf%sf(x_beg:x_end,y_beg:y_end,z_beg:z_end)
+                write (varname, '(A)') 'T'
+                call s_write_field(varname, t_step)
+            end if
+        end if
+
+        do i = 1, eqn_idx%E - eqn_idx%mom%beg
+            if (flux_wrt(i)) then
+                call s_derive_flux_limiter(i, q_prim_vf, out%q_sf)
+                write (varname, '(A,I0)') 'flux', i
+                call s_write_field(varname, t_step)
+            end if
+        end do
+
+        if (E_wrt .or. cons_vars_wrt) then
+            write (varname, '(A)') 'E'
+            call s_write_field(varname, t_step, q_cons_vf(eqn_idx%E), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+        end if
+
+        if (model_eqns == model_eqns_6eq) then
+            do i = 1, num_fluids
+                if (alpha_rho_e_wrt(i) .or. cons_vars_wrt) then
+                    write (varname, '(A,I0)') 'alpha_rho_e', i
+                    call s_write_field(varname, t_step, q_cons_vf(i + eqn_idx%int_en%beg - 1), x_beg, x_end, y_beg, y_end, z_beg, &
+                                       & z_end)
+                end if
+            end do
+        end if
+
+        if (fft_wrt) then
+            do l = 0, p
+                do k = 0, n
+                    do j = 0, m
+                        data_cmplx(j + 1, k + 1, l + 1) = cmplx(q_cons_vf(eqn_idx%mom%beg)%sf(j, k, l)/q_cons_vf(1)%sf(j, k, l), &
+                                   & 0._wp)
+                    end do
+                end do
+            end do
+
+            call s_mpi_FFT_fwd()
+
+            En_real = 0.5_wp*abs(data_cmplx_z)**2._wp/(1._wp*Nx*Ny*Nz)**2._wp
+
+            do l = 0, p
+                do k = 0, n
+                    do j = 0, m
+                        data_cmplx(j + 1, k + 1, l + 1) = cmplx(q_cons_vf(eqn_idx%mom%beg + 1)%sf(j, k, l)/q_cons_vf(1)%sf(j, k, &
+                                   & l), 0._wp)
+                    end do
+                end do
+            end do
+
+            call s_mpi_FFT_fwd()
+
+            En_real = En_real + 0.5_wp*abs(data_cmplx_z)**2._wp/(1._wp*Nx*Ny*Nz)**2._wp
+
+            do l = 0, p
+                do k = 0, n
+                    do j = 0, m
+                        data_cmplx(j + 1, k + 1, l + 1) = cmplx(q_cons_vf(eqn_idx%mom%beg + 2)%sf(j, k, l)/q_cons_vf(1)%sf(j, k, &
+                                   & l), 0._wp)
+                    end do
+                end do
+            end do
+
+            call s_mpi_FFT_fwd()
+
+            En_real = En_real + 0.5_wp*abs(data_cmplx_z)**2._wp/(1._wp*Nx*Ny*Nz)**2._wp
+
+            do kf = 1, Nf
+                En(kf) = 0._wp
+            end do
+
+            do l = 1, Nz
+                do k = 1, Nyloc2
+                    do j = 1, Nxloc
+                        j_glb = j + cart3d_coords(2)*Nxloc
+                        k_glb = k + cart3d_coords(3)*Nyloc2
+                        l_glb = l
+
+                        if (j_glb >= (m_glb + 1)/2) then
+                            kx = (j_glb - 1) - (m_glb + 1)
+                        else
+                            kx = j_glb - 1
+                        end if
+
+                        if (k_glb >= (n_glb + 1)/2) then
+                            ky = (k_glb - 1) - (n_glb + 1)
+                        else
+                            ky = k_glb - 1
+                        end if
+
+                        if (l_glb >= (p_glb + 1)/2) then
+                            kz = (l_glb - 1) - (p_glb + 1)
+                        else
+                            kz = l_glb - 1
+                        end if
+
+                        kf = nint(sqrt(kx**2._wp + ky**2._wp + kz**2._wp)) + 1
+
+                        En(kf) = En(kf) + En_real(j, k, l)
+                    end do
+                end do
+            end do
+
+#ifdef MFC_MPI
+            call MPI_ALLREDUCE(MPI_IN_PLACE, En, Nf, mpi_p, MPI_SUM, MPI_COMM_WORLD, ierr)
+#endif
+
+            if (proc_rank == 0) then
+                call s_create_directory('En_FFT_DATA')
+                write (filename, '(a,i0,a)') 'En_FFT_DATA/En_tot', t_step, '.dat'
+                inquire (FILE=filename, EXIST=file_exists)
+                if (file_exists) then
+                    call s_delete_file(trim(filename))
+                end if
+            end if
+
+            do kf = 1, Nf
+                if (proc_rank == 0) then
+                    write (filename, '(a,i0,a)') 'En_FFT_DATA/En_tot', t_step, '.dat'
+                    inquire (FILE=filename, EXIST=file_exists)
+                    if (file_exists) then
+                        open (1, file=filename, position='append', status='old')
+                        write (1, *) En(kf), t_step
+                        close (1)
+                    else
+                        open (1, file=filename, status='new')
+                        write (1, *) En(kf), t_step
+                        close (1)
+                    end if
+                end if
+            end do
+        end if
+
+        if (mhd .and. prim_vars_wrt) then
+            do i = eqn_idx%B%beg, eqn_idx%B%end
+                ! 1D: output By, Bz
+                if (n == 0) then
+                    if (i == eqn_idx%B%beg) then
+                        write (varname, '(A)') 'By'
+                    else
+                        write (varname, '(A)') 'Bz'
+                    end if
+                    ! 2D/3D: output Bx, By, Bz
+                else
+                    if (i == eqn_idx%B%beg) then
+                        write (varname, '(A)') 'Bx'
+                    else if (i == eqn_idx%B%beg + 1) then
+                        write (varname, '(A)') 'By'
+                    else
+                        write (varname, '(A)') 'Bz'
+                    end if
+                end if
+                call s_write_field(varname, t_step, q_prim_vf(i), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+            end do
+        end if
+
+        if (hypoelasticity) then
+            do i = 1, eqn_idx%stress%end - eqn_idx%stress%beg + 1
+                if (prim_vars_wrt) then
+                    write (varname, '(A,I0)') 'tau', i
+                    call s_write_field(varname, t_step, q_prim_vf(i - 1 + eqn_idx%stress%beg), x_beg, x_end, y_beg, y_end, z_beg, &
+                                       & z_end)
+                end if
+            end do
+        end if
+
+        if (cont_damage) then
+            write (varname, '(A)') 'damage_state'
+            call s_write_field(varname, t_step, q_prim_vf(eqn_idx%damage), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+        end if
+
+        if (hyper_cleaning) then
+            write (varname, '(A)') 'psi'
+            call s_write_field(varname, t_step, q_cons_vf(eqn_idx%psi), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+        end if
+
+        if (pres_wrt .or. prim_vars_wrt) then
+            write (varname, '(A)') 'pres'
+            call s_write_field(varname, t_step, q_prim_vf(eqn_idx%E), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+        end if
+
+        if (((model_eqns == model_eqns_5eq) .and. (bubbles_euler .neqv. .true.)) .or. (model_eqns == model_eqns_6eq)) then
+            do i = 1, num_fluids - 1
+                if (alpha_wrt(i) .or. (cons_vars_wrt .or. prim_vars_wrt)) then
+                    write (varname, '(A,I0)') 'alpha', i
+                    call s_write_field(varname, t_step, q_cons_vf(i + eqn_idx%E), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+                end if
+            end do
+
+            if (alpha_wrt(num_fluids) .or. (cons_vars_wrt .or. prim_vars_wrt)) then
+                if (igr) then
+                    do k = z_beg, z_end
+                        do j = y_beg, y_end
+                            do i = x_beg, x_end
+                                out%q_sf(i, j, k) = 1._wp
+                                do l = 1, num_fluids - 1
+                                    out%q_sf(i, j, k) = out%q_sf(i, j, k) - q_cons_vf(eqn_idx%E + l)%sf(i, j, k)
+                                end do
+                            end do
+                        end do
+                    end do
+                else
+                    out%q_sf(:,:,:) = q_cons_vf(eqn_idx%adv%end)%sf(x_beg:x_end,y_beg:y_end,z_beg:z_end)
+                end if
+                write (varname, '(A,I0)') 'alpha', num_fluids
+                call s_write_field(varname, t_step)
+            end if
+        end if
+
+        if (gamma_wrt .or. (model_eqns == model_eqns_gamma_law .and. (cons_vars_wrt .or. prim_vars_wrt))) then
+            out%q_sf(:,:,:) = gamma_sf(x_beg:x_end,y_beg:y_end,z_beg:z_end)
+            write (varname, '(A)') 'gamma'
+            call s_write_field(varname, t_step)
+        end if
+
+        if (heat_ratio_wrt) then
+            call s_derive_specific_heat_ratio(out%q_sf)
+            write (varname, '(A)') 'heat_ratio'
+            call s_write_field(varname, t_step)
+        end if
+
+        if (pi_inf_wrt .or. (model_eqns == model_eqns_gamma_law .and. (cons_vars_wrt .or. prim_vars_wrt))) then
+            out%q_sf(:,:,:) = pi_inf_sf(x_beg:x_end,y_beg:y_end,z_beg:z_end)
+            write (varname, '(A)') 'pi_inf'
+            call s_write_field(varname, t_step)
+        end if
+
+        if (pres_inf_wrt) then
+            call s_derive_liquid_stiffness(out%q_sf)
+            write (varname, '(A)') 'pres_inf'
+            call s_write_field(varname, t_step)
+        end if
+
+        if (c_wrt) then
+            do k = -offset_z%beg, p + offset_z%end
+                do j = -offset_y%beg, n + offset_y%end
+                    do i = -offset_x%beg, m + offset_x%end
+                        do l = 1, eqn_idx%adv%end - eqn_idx%E
+                            adv(l) = q_prim_vf(eqn_idx%E + l)%sf(i, j, k)
+                            alpha_rho(l) = q_prim_vf(eqn_idx%cont%beg + l - 1)%sf(i, j, k)
+                        end do
+
+                        pres = q_prim_vf(eqn_idx%E)%sf(i, j, k)
+
+                        call s_compute_speed_of_sound(pres, rho_sf(i, j, k), gamma_sf(i, j, k), pi_inf_sf(i, j, k), adv, c, &
+                                                      & alpha_rho)
+
+                        out%q_sf(i, j, k) = c
+                    end do
+                end do
+            end do
+
+            write (varname, '(A)') 'c'
+            call s_write_field(varname, t_step)
+        end if
+
+        if (T_wrt) then
+            do l = 1, num_fluids
+                do k = -offset_z%beg, p + offset_z%end
+                    do j = -offset_y%beg, n + offset_y%end
+                        do i = -offset_x%beg, m + offset_x%end
+                            call s_phase_temperature(q_prim_vf(eqn_idx%cont%beg + l - 1)%sf(i, j, &
+                                                     & k)/max(q_prim_vf(eqn_idx%E + l)%sf(i, j, k), sgm_eps), &
+                                                     & q_prim_vf(eqn_idx%E)%sf(i, j, k), l, T)
+                            out%q_sf(i, j, k) = T
+                        end do
+                    end do
+                end do
+                write (varname, '(A,I0)') 'T', l
+                call s_write_field(varname, t_step)
+            end do
+        end if
+
+        do i = 1, 3
+            if (omega_wrt(i)) then
+                call s_derive_vorticity_component(i, q_prim_vf, out%q_sf)
+                write (varname, '(A,I0)') 'omega', i
+                call s_write_field(varname, t_step)
+            end if
+        end do
+
+        if (ib) then
+            out%q_sf(:,:,:) = real(ib_markers%sf(-offset_x%beg:m + offset_x%end,-offset_y%beg:n + offset_y%end, &
+                     & -offset_z%beg:p + offset_z%end), wp)
+            varname = 'ib_markers'
+            call s_write_field(varname, t_step)
+        end if
+
+        if (p > 0 .and. qm_wrt) then
+            call s_derive_qm(q_prim_vf, out%q_sf)
+            write (varname, '(A)') 'qm'
+            call s_write_field(varname, t_step)
+        end if
+
+        if (liutex_wrt) then
+            call s_derive_liutex(q_prim_vf, liutex_mag, liutex_axis)
+
+            out%q_sf = liutex_mag
+            write (varname, '(A)') 'liutex_mag'
+            call s_write_field(varname, t_step)
+
+            do i = 1, 3
+                out%q_sf = liutex_axis(:,:,:,i)
+                write (varname, '(A,I0)') 'liutex_axis', i
+                call s_write_field(varname, t_step)
+            end do
+        end if
+
+        if (schlieren_wrt) then
+            call s_derive_numerical_schlieren_function(q_cons_vf, out%q_sf)
+            write (varname, '(A)') 'schlieren'
+            call s_write_field(varname, t_step)
+        end if
+
+        if (cf_wrt) then
+            write (varname, '(A,I0)') 'color_function'
+            call s_write_field(varname, t_step, q_cons_vf(eqn_idx%c), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+        end if
+
+        if (bubbles_euler) then
+            do i = eqn_idx%adv%beg, eqn_idx%adv%end
+                write (varname, '(A,I0)') 'alpha', i - eqn_idx%E
+                call s_write_field(varname, t_step, q_cons_vf(i), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+            end do
+        end if
+
+        if (bubbles_euler) then
+            ! nR
+            do i = 1, nb
+                write (varname, '(A,I3.3)') 'nR', i
+                call s_write_field(varname, t_step, q_cons_vf(qbmm_idx%rs(i)), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+            end do
+
+            ! nRdot
+            do i = 1, nb
+                write (varname, '(A,I3.3)') 'nV', i
+                call s_write_field(varname, t_step, q_cons_vf(qbmm_idx%vs(i)), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+            end do
+            if ((polytropic .neqv. .true.) .and. (.not. qbmm)) then
+                ! nP
+                do i = 1, nb
+                    write (varname, '(A,I3.3)') 'nP', i
+                    call s_write_field(varname, t_step, q_cons_vf(qbmm_idx%ps(i)), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+                end do
+
+                ! nM
+                do i = 1, nb
+                    write (varname, '(A,I3.3)') 'nM', i
+                    call s_write_field(varname, t_step, q_cons_vf(qbmm_idx%ms(i)), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+                end do
+            end if
+
+            ! number density
+            if (adv_n) then
+                write (varname, '(A)') 'n'
+                call s_write_field(varname, t_step, q_cons_vf(eqn_idx%n), x_beg, x_end, y_beg, y_end, z_beg, z_end)
+            end if
+        end if
+
+        if (bubbles_lagrange) then
+            ! Void fraction field
+            out%q_sf(:,:,:) = 1._wp - q_cons_vf(beta_idx)%sf(-offset_x%beg:m + offset_x%end,-offset_y%beg:n + offset_y%end, &
+                     & -offset_z%beg:p + offset_z%end)
+            write (varname, '(A)') 'voidFraction'
+            call s_write_field(varname, t_step)
+
+            if (lag_txt_wrt) call s_write_lag_bubbles_results_to_text(t_step)  ! text output
+            if (lag_db_wrt) call s_write_lag_bubbles_to_formatted_database_file(t_step)  ! silo file output
+        end if
+
+        if (ib_state_wrt) call s_write_ib_bodies_to_formatted_database_file(t_step)
+
+        if (sim_data .and. proc_rank == 0) then
+            call s_close_intf_data_file()
+            call s_close_energy_data_file()
+        end if
+
+        call s_close_formatted_database_file()
+
+    end subroutine s_save_data
+
+    !> Fill out%q_sf from src (if given), write varname to the database, and clear varname.
+    !! @param varname  field name (set by caller); blanked on return
+    !! @param t_step   current time step
+    !! @param src      optional scalar_field to slice into out%q_sf
+    !! @param x_beg, x_end, y_beg, y_end, z_beg, z_end  output region bounds (required if src present)
+    impure subroutine s_write_field(varname, t_step, src, x_beg, x_end, y_beg, y_end, z_beg, z_end)
+
+        character(LEN=name_len), intent(inout)   :: varname
+        integer, intent(in)                      :: t_step
+        type(scalar_field), intent(in), optional :: src
+        integer, intent(in), optional            :: x_beg, x_end, y_beg, y_end, z_beg, z_end
+
+        if (present(src)) then
+            @:ASSERT(present(x_beg) .and. present(x_end) .and. present(y_beg) .and. present(y_end) .and. present(z_beg) &
+                     & .and. present(z_end), "s_write_field: src requires all six output bounds")
+            out%q_sf(:,:,:) = src%sf(x_beg:x_end,y_beg:y_end,z_beg:z_end)
+        end if
+        call s_write_variable_to_formatted_database_file(varname, t_step)
+        varname(:) = ' '
+
+    end subroutine s_write_field
+
+    !> Transpose 3-D complex data from x-pencil to y-pencil layout via MPI_Alltoall.
+    subroutine s_mpi_transpose_x2y
+
+        complex(c_double_complex), allocatable :: sendbuf(:), recvbuf(:)
+        integer                                :: dest_rank, src_rank
+        integer                                :: i, j, k, l
+
+#ifdef MFC_MPI
+        allocate (sendbuf(Nx*Nyloc*Nzloc))
+        allocate (recvbuf(Nx*Nyloc*Nzloc))
+
+        do dest_rank = 0, num_procs_y - 1
+            do l = 1, Nzloc
+                do k = 1, Nyloc
+                    do j = 1, Nxloc
+                        sendbuf(j + (k - 1)*Nxloc + (l - 1)*Nxloc*Nyloc + dest_rank*Nxloc*Nyloc*Nzloc) = data_cmplx(j &
+                                & + dest_rank*Nxloc, k, l)
+                    end do
+                end do
+            end do
+        end do
+
+        call MPI_Alltoall(sendbuf, Nxloc*Nyloc*Nzloc, MPI_C_DOUBLE_COMPLEX, recvbuf, Nxloc*Nyloc*Nzloc, MPI_C_DOUBLE_COMPLEX, &
+                          & MPI_COMM_CART12, ierr)
+
+        do src_rank = 0, num_procs_y - 1
+            do l = 1, Nzloc
+                do k = 1, Nyloc
+                    do j = 1, Nxloc
+                        data_cmplx_y(j, k + src_rank*Nyloc, &
+                                     & l) = recvbuf(j + (k - 1)*Nxloc + (l - 1)*Nxloc*Nyloc + src_rank*Nxloc*Nyloc*Nzloc)
+                    end do
+                end do
+            end do
+        end do
+
+        deallocate (sendbuf)
+        deallocate (recvbuf)
+#endif
+
+    end subroutine s_mpi_transpose_x2y
+
+    !> Transpose 3-D complex data from y-pencil to z-pencil layout via MPI_Alltoall.
+    subroutine s_mpi_transpose_y2z
+
+        complex(c_double_complex), allocatable :: sendbuf(:), recvbuf(:)
+        integer                                :: dest_rank, src_rank
+        integer                                :: j, k, l
+
+#ifdef MFC_MPI
+        allocate (sendbuf(Ny*Nxloc*Nzloc))
+        allocate (recvbuf(Ny*Nxloc*Nzloc))
+
+        do dest_rank = 0, num_procs_z - 1
+            do l = 1, Nzloc
+                do j = 1, Nxloc
+                    do k = 1, Nyloc2
+                        sendbuf(k + (j - 1)*Nyloc2 + (l - 1)*(Nyloc2*Nxloc) + dest_rank*Nyloc2*Nxloc*Nzloc) = data_cmplx_y(j, &
+                                & k + dest_rank*Nyloc2, l)
+                    end do
+                end do
+            end do
+        end do
+
+        call MPI_Alltoall(sendbuf, Nyloc2*Nxloc*Nzloc, MPI_C_DOUBLE_COMPLEX, recvbuf, Nyloc2*Nxloc*Nzloc, MPI_C_DOUBLE_COMPLEX, &
+                          & MPI_COMM_CART13, ierr)
+
+        do src_rank = 0, num_procs_z - 1
+            do l = 1, Nzloc
+                do j = 1, Nxloc
+                    do k = 1, Nyloc2
+                        data_cmplx_z(j, k, &
+                                     & l + src_rank*Nzloc) = recvbuf(k + (j - 1)*Nyloc2 + (l - 1)*(Nyloc2*Nxloc) &
+                                     & + src_rank*Nyloc2*Nxloc*Nzloc)
+                    end do
+                end do
+            end do
+        end do
+
+        deallocate (sendbuf)
+        deallocate (recvbuf)
+#endif
+
+    end subroutine s_mpi_transpose_y2z
+
+    !> Initialize all post-process sub-modules, set up I/O pointers, and prepare FFTW plans and MPI communicators.
+    impure subroutine s_initialize_modules
+
+        integer :: size_n(1), inembed(1), onembed(1)
+
+        call s_initialize_global_parameters_module()
+        if (bubbles_euler .or. bubbles_lagrange) then
+            call s_initialize_bubbles_model()
+        end if
+        if (num_procs > 1) then
+            call s_initialize_mpi_proxy_module()
+            call s_initialize_mpi_common_module(exchange_all_chemistry_temperatures_in=.true., use_rdma_transport_in=.false.)
+        end if
+        call s_initialize_boundary_common_module()
+        call s_initialize_variables_conversion_module(store_mixture_fields=.true., lagrange_beta_index=beta_idx)
+        call s_initialize_data_input_module()
+        call s_initialize_derived_variables_module()
+        call s_initialize_data_output_module()
+
+        if (parallel_io .neqv. .true.) then
+            s_read_data_files => s_read_serial_data_files
+        else
+            s_read_data_files => s_read_parallel_data_files
+        end if
+
+#ifdef MFC_MPI
+        if (fft_wrt) then
+            num_procs_x = (m_glb + 1)/(m + 1)
+            num_procs_y = (n_glb + 1)/(n + 1)
+            num_procs_z = (p_glb + 1)/(p + 1)
+
+            Nx = m_glb + 1
+            Ny = n_glb + 1
+            Nz = p_glb + 1
+
+            Nxloc = (m_glb + 1)/num_procs_y
+            Nyloc = n + 1
+            Nyloc2 = (n_glb + 1)/num_procs_z
+            Nzloc = p + 1
+
+            Nf = max(Nx, Ny, Nz)
+
+            @:ALLOCATE(data_in(Nx*Nyloc*Nzloc))
+            @:ALLOCATE(data_out(Nx*Nyloc*Nzloc))
+
+            @:ALLOCATE(data_cmplx(Nx, Nyloc, Nzloc))
+            @:ALLOCATE(data_cmplx_y(Nxloc, Ny, Nzloc))
+            @:ALLOCATE(data_cmplx_z(Nxloc, Nyloc2, Nz))
+
+            @:ALLOCATE(En_real(Nxloc, Nyloc2, Nz))
+            @:ALLOCATE(En(Nf))
+
+            size_n(1) = Nx
+            inembed(1) = Nx
+            onembed(1) = Nx
+
+            fwd_plan_x = fftw_plan_many_dft(1, size_n, Nyloc*Nzloc, data_in, inembed, 1, Nx, data_out, onembed, 1, Nx, &
+                                            & FFTW_FORWARD, FFTW_MEASURE)
+
+            size_n(1) = Ny
+            inembed(1) = Ny
+            onembed(1) = Ny
+
+            fwd_plan_y = fftw_plan_many_dft(1, size_n, Nxloc*Nzloc, data_out, inembed, 1, Ny, data_in, onembed, 1, Ny, &
+                                            & FFTW_FORWARD, FFTW_MEASURE)
+
+            size_n(1) = Nz
+            inembed(1) = Nz
+            onembed(1) = Nz
+
+            fwd_plan_z = fftw_plan_many_dft(1, size_n, Nxloc*Nyloc2, data_in, inembed, 1, Nz, data_out, onembed, 1, Nz, &
+                                            & FFTW_FORWARD, FFTW_MEASURE)
+
+            call MPI_CART_CREATE(MPI_COMM_WORLD, 3, (/num_procs_x, num_procs_y, num_procs_z/), (/.true., .true., .true./), &
+                                 & .false., MPI_COMM_CART, ierr)
+            call MPI_CART_COORDS(MPI_COMM_CART, proc_rank, 3, cart3d_coords, ierr)
+
+            call MPI_Cart_SUB(MPI_COMM_CART, (/.true., .true., .false./), MPI_COMM_CART12, ierr)
+            call MPI_COMM_RANK(MPI_COMM_CART12, proc_rank12, ierr)
+            call MPI_CART_COORDS(MPI_COMM_CART12, proc_rank12, 2, cart2d12_coords, ierr)
+
+            call MPI_Cart_SUB(MPI_COMM_CART, (/.true., .false., .true./), MPI_COMM_CART13, ierr)
+            call MPI_COMM_RANK(MPI_COMM_CART13, proc_rank13, ierr)
+            call MPI_CART_COORDS(MPI_COMM_CART13, proc_rank13, 2, cart2d13_coords, ierr)
+        end if
+#endif
+
+    end subroutine s_initialize_modules
+
+    !> Perform a distributed forward 3-D FFT using pencil decomposition with FFTW and MPI transposes.
+    subroutine s_mpi_FFT_fwd
+
+        integer :: j, k, l
+
+#ifdef MFC_MPI
+        do l = 1, Nzloc
+            do k = 1, Nyloc
+                do j = 1, Nx
+                    data_in(j + (k - 1)*Nx + (l - 1)*Nx*Nyloc) = data_cmplx(j, k, l)
+                end do
+            end do
+        end do
+
+        call fftw_execute_dft(fwd_plan_x, data_in, data_out)
+
+        do l = 1, Nzloc
+            do k = 1, Nyloc
+                do j = 1, Nx
+                    data_cmplx(j, k, l) = data_out(j + (k - 1)*Nx + (l - 1)*Nx*Nyloc)
+                end do
+            end do
+        end do
+
+        call s_mpi_transpose_x2y !!Change Pencil from data_cmplx to data_cmpx_y
+
+        do l = 1, Nzloc
+            do k = 1, Nxloc
+                do j = 1, Ny
+                    data_out(j + (k - 1)*Ny + (l - 1)*Ny*Nxloc) = data_cmplx_y(k, j, l)
+                end do
+            end do
+        end do
+
+        call fftw_execute_dft(fwd_plan_y, data_out, data_in)
+
+        do l = 1, Nzloc
+            do k = 1, Nxloc
+                do j = 1, Ny
+                    data_cmplx_y(k, j, l) = data_in(j + (k - 1)*Ny + (l - 1)*Ny*Nxloc)
+                end do
+            end do
+        end do
+
+        call s_mpi_transpose_y2z !!Change Pencil from data_cmplx_y to data_cmpx_z
+
+        do l = 1, Nyloc2
+            do k = 1, Nxloc
+                do j = 1, Nz
+                    data_in(j + (k - 1)*Nz + (l - 1)*Nz*Nxloc) = data_cmplx_z(k, l, j)
+                end do
+            end do
+        end do
+
+        call fftw_execute_dft(fwd_plan_z, data_in, data_out)
+
+        do l = 1, Nyloc2
+            do k = 1, Nxloc
+                do j = 1, Nz
+                    data_cmplx_z(k, l, j) = data_out(j + (k - 1)*Nz + (l - 1)*Nz*Nxloc)
+                end do
+            end do
+        end do
+#endif
+
+    end subroutine s_mpi_FFT_fwd
+
+    !> Set up the MPI environment, read and broadcast user inputs, and decompose the computational domain.
+    impure subroutine s_initialize_mpi_domain
+
+        type(int_bounds_info), dimension(3) :: output_offsets
+
+        num_dims = 1 + min(1, n) + min(1, p)
+
+        call s_mpi_initialize()
+
+        if (proc_rank == 0) then
+            call s_assign_default_values_to_user_inputs()
+            call s_read_input_file()
+            call s_check_input_file()
+
+            print '(" Post-processing a ", I0, "x", I0, "x", I0, " case on ", I0, " rank(s)")', m, n, p, num_procs
+        end if
+
+        call s_mpi_bcast_user_inputs()
+        call s_initialize_parallel_io()
+        output_offsets = (/offset_x, offset_y, offset_z/)
+        call s_mpi_decompose_computational_domain(write_silo_ghost_offsets=format == format_silo, adjust_local_domains=.false., &
+            & output_offsets=output_offsets)
+        offset_x = output_offsets(1)
+        offset_y = output_offsets(2)
+        offset_z = output_offsets(3)
+        call s_check_inputs_fft()
+
+        bc = bc_xyz_info(bc_x, bc_y, bc_z)
+
+    end subroutine s_initialize_mpi_domain
+
+    !> Destroy FFTW plans, free MPI communicators, and finalize all post-process sub-modules.
+    impure subroutine s_finalize_modules
+
+        s_read_data_files => null()
+
+        if (fft_wrt) then
+            if (c_associated(fwd_plan_x)) call fftw_destroy_plan(fwd_plan_x)
+            if (c_associated(fwd_plan_y)) call fftw_destroy_plan(fwd_plan_y)
+            if (c_associated(fwd_plan_z)) call fftw_destroy_plan(fwd_plan_z)
+            if (allocated(data_in)) deallocate (data_in)
+            if (allocated(data_out)) deallocate (data_out)
+            if (allocated(data_cmplx)) deallocate (data_cmplx)
+            if (allocated(data_cmplx_y)) deallocate (data_cmplx_y)
+            if (allocated(data_cmplx_z)) deallocate (data_cmplx_z)
+            if (allocated(En_real)) deallocate (En_real)
+            if (allocated(En)) deallocate (En)
+            call fftw_cleanup()
+        end if
+
+#ifdef MFC_MPI
+        if (fft_wrt) then
+            if (MPI_COMM_CART12 /= MPI_COMM_NULL) call MPI_Comm_free(MPI_COMM_CART12, ierr)
+            if (MPI_COMM_CART13 /= MPI_COMM_NULL) call MPI_Comm_free(MPI_COMM_CART13, ierr)
+            if (MPI_COMM_CART /= MPI_COMM_NULL) call MPI_Comm_free(MPI_COMM_CART, ierr)
+        end if
+#endif
+
+        call s_finalize_data_output_module()
+        call s_finalize_derived_variables_module()
+        call s_finalize_data_input_module()
+        call s_finalize_variables_conversion_module()
+        if (num_procs > 1) then
+            call s_finalize_mpi_proxy_module()
+            call s_finalize_mpi_common_module()
+        end if
+        call s_finalize_global_parameters_module()
+
+        call s_mpi_finalize()
+
+    end subroutine s_finalize_modules
+
+end module m_start_up

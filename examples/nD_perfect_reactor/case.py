@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # Reference:
 # + https://doi.org/10.1063/1.1696266
-import json, argparse
+import argparse
+import json
+
 import cantera as ct
 
 from mfc.case_utils import *
@@ -61,20 +63,20 @@ case = {
     "t_step_print": NS,
     "parallel_io": "T" if args.ndim > 1 and args.mfc.get("mpi", True) else "F",
     # Simulation Algorithm Parameters
-    "model_eqns": 2,
+    "model_eqns": "5eq",
     "num_fluids": 1,
     "num_patches": 1,
     "mpp_lim": "F",
     "mixture_err": "F",
-    "time_stepper": 3,
+    "time_stepper": "rk3",
     "weno_order": 5,
     "weno_eps": 1e-16,
     "weno_avg": "F",
     "mapped_weno": "T",
     "mp_weno": "T",
-    "riemann_solver": 1,
-    "wave_speeds": 1,
-    "avg_state": 2,
+    "riemann_solver": "hll",
+    "wave_speeds": "direct",
+    "avg_state": "arithmetic",
     "bc_x%beg": -1,
     "bc_x%end": -1,
     "bc_y%beg": -1,
@@ -82,8 +84,8 @@ case = {
     "bc_z%beg": -1,
     "bc_z%end": -1,
     # Formatted Database Files Structure Parameters
-    "format": 1,
-    "precision": 2,
+    "format": "silo",
+    "precision": "double",
     "prim_vars_wrt": "T",
     "chem_wrt_T": "T",
     # Patch 1
@@ -102,6 +104,7 @@ case = {
     "patch_icpp(1)%alpha_rho(1)": sol.density,
     # Fluids Physical Parameters
     "fluid_pp(1)%gamma": 1.0e00 / (4.4e00 - 1.0e00),
+    "fluid_pp(1)%eos": "stiffened_gas",
     "fluid_pp(1)%pi_inf": 0,
 }
 
@@ -118,7 +121,7 @@ if args.chemistry:
 
     for i in range(len(sol.Y)):
         case[f"chem_wrt_Y({i + 1})"] = "T"
-        case[f"patch_icpp(1)%Y({i+1})"] = sol.Y[i]
+        case[f"patch_icpp(1)%Y({i + 1})"] = sol.Y[i]
 
 case = remove_higher_dimensional_keys(case, args.ndim)
 

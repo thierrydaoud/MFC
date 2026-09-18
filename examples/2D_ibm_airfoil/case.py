@@ -30,7 +30,7 @@ print(
             # Only one patches are necessary, the air tube
             "num_patches": 1,
             # Use the 5 equation model
-            "model_eqns": 2,
+            "model_eqns": "5eq",
             # 6 equations model does not need the K \div(u) term
             "alt_soundspeed": "F",
             # One fluids: air
@@ -40,21 +40,21 @@ print(
             # Correct errors when computing speed of sound
             "mixture_err": "T",
             # Use TVD RK3 for time marching
-            "time_stepper": 3,
+            "time_stepper": "rk3",
             # Reconstruct the primitive variables to minimize spurious
             # Use WENO5
             "weno_order": 5,
             "weno_eps": 1.0e-16,
             "weno_Re_flux": "F",
             "weno_avg": "T",
-            "avg_state": 2,
+            "avg_state": "arithmetic",
             # Use the mapped WENO weights to maintain monotinicity
             "mapped_weno": "T",
             "null_weights": "F",
             "mp_weno": "T",
             # Use the HLLC  Riemann solver
-            "riemann_solver": 2,
-            "wave_speeds": 1,
+            "riemann_solver": "hllc",
+            "wave_speeds": "direct",
             # We use reflective boundary conditions at octant edges and
             # non-reflective boundary conditions at the domain edges
             "bc_x%beg": -3,
@@ -64,9 +64,10 @@ print(
             # Set IB to True and add 1 patch
             "ib": "T",
             "num_ibs": 1,
+            "fd_order": 2,
             # Formatted Database Files Structure Parameters
-            "format": 1,
-            "precision": 2,
+            "format": "silo",
+            "precision": "double",
             "prim_vars_wrt": "T",
             "E_wrt": "T",
             "parallel_io": "T",
@@ -90,17 +91,18 @@ print(
             "patch_ib(1)%geometry": 4,
             "patch_ib(1)%x_centroid": 1.0e-03,
             "patch_ib(1)%y_centroid": 3.0e-03,
-            "patch_ib(1)%c": 1.0e-03,
-            "patch_ib(1)%t": 0.15,
-            "patch_ib(1)%p": 0.4,
-            "patch_ib(1)%m": 0.02,
-            "patch_ib(1)%theta": 30,
+            "patch_ib(1)%airfoil_id": 1,
+            "ib_airfoil(1)%c": 1.0e-03,
+            "ib_airfoil(1)%t": 0.15,
+            "ib_airfoil(1)%p": 0.4,
+            "ib_airfoil(1)%m": 0.02,
+            "patch_ib(1)%angles(3)": -0.5235987756,  # 30 degrees clockwise rotation, in radians
             # Fluids Physical Parameters
             # Use the same stiffness as the air bubble
-            "fluid_pp(1)%gamma": 1.0e00 / (gam_a - 1.0e00),  # 2.50(Not 1.40)
-            "fluid_pp(1)%pi_inf": 0,
-            "fluid_pp(2)%gamma": 1.0e00 / (gam_b - 1.0e00),  # 2.50(Not 1.40)
-            "fluid_pp(2)%pi_inf": 0,
+            "fluid_pp(1)%gamma": 1.0e00 / (gam_a - 1.0e00),  # 2.50 (Not 1.40)
+            "fluid_pp(1)%eos": "ideal_gas",
+            "fluid_pp(2)%gamma": 1.0e00 / (gam_b - 1.0e00),  # 2.50 (Not 1.40)
+            "fluid_pp(2)%eos": "ideal_gas",
         }
     )
 )

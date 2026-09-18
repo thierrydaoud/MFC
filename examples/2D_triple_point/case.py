@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import math
 import json
+import math
 
 eps = 1e-8
 Nx = 699
@@ -12,10 +12,10 @@ print(
             # Logistics
             "run_time_info": "F",
             # Computational Domain Parameters
-            "x_domain%beg": 0,
-            "x_domain%end": 7,
-            "y_domain%beg": 0,
-            "y_domain%end": 3,
+            "x_domain%beg": 0.0,
+            "x_domain%end": 7.0,
+            "y_domain%beg": 0.0,
+            "y_domain%end": 3.0,
             "m": int(Nx),
             "n": int(Ny),
             "p": 0,
@@ -26,12 +26,12 @@ print(
             "t_save": 0.04,
             # Simulation Algorithm Parameters
             "num_patches": 3,
-            "model_eqns": 2,
+            "model_eqns": "5eq",
             "alt_soundspeed": "F",
             "num_fluids": 2,
             "mpp_lim": "T",
             "mixture_err": "T",
-            "time_stepper": 3,
+            "time_stepper": "rk3",
             "weno_order": 7,
             "weno_eps": 1.0e-16,
             "weno_Re_flux": "F",
@@ -39,16 +39,16 @@ print(
             "mapped_weno": "T",
             "null_weights": "F",
             "mp_weno": "F",
-            "riemann_solver": 2,
-            "wave_speeds": 1,
-            "avg_state": 2,
+            "riemann_solver": "hllc",
+            "wave_speeds": "direct",
+            "avg_state": "arithmetic",
             "bc_x%beg": -3,  # 11,
             "bc_x%end": -3,  # 12
             "bc_y%beg": -3,
             "bc_y%end": -3,
             # Formatted Database Files Structure Parameters
-            "format": 1,
-            "precision": 2,
+            "format": "silo",
+            "precision": "double",
             "prim_vars_wrt": "T",
             "schlieren_wrt": "T",
             "fd_order": 4,
@@ -98,9 +98,9 @@ print(
             "patch_icpp(3)%alpha(2)": 1 - eps,  # 0.05,
             # Fluids Physical Parameters
             "fluid_pp(1)%gamma": 1.0 / (1.5 - 1.0),
-            "fluid_pp(1)%pi_inf": 0,
+            "fluid_pp(1)%eos": "ideal_gas",
             "fluid_pp(2)%gamma": 1.0 / (1.4 - 1.0),
-            "fluid_pp(2)%pi_inf": 0.0,
+            "fluid_pp(2)%eos": "ideal_gas",
         }
     )
 )

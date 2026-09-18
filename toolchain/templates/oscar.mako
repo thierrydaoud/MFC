@@ -4,8 +4,9 @@
 
 % if engine == 'batch':
 #SBATCH --nodes=${nodes}
-#SBATCH --ntasks-per-node=${tasks_per_node}
+#SBATCH --tasks-per-node=${tasks_per_node}
 #SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=4g
 #SBATCH --job-name="${name}"
 #SBATCH --time=${walltime}
 % if partition:
@@ -14,10 +15,9 @@
 % if account:
 #SBATCH --account="${account}"
 % endif
-% if gpu:
-#SBATCH --gpus-per-node=${tasks_per_node}
-#SBATCH --mem=64G
-#SBATCH --gpu-bind=closest
+% if gpu_enabled:
+#SBATCH --gpu-bind=verbose,closest
+#SBATCH --gres=gpu:v100-16:${tasks_per_node}
 % endif
 #SBATCH --output="${name}.out"
 #SBATCH --error="${name}.err"
@@ -31,8 +31,8 @@
 ${helpers.template_prologue()}
 
 ok ":) Loading modules:\n"
-cd "${MFC_ROOTDIR}"
-. ./mfc.sh load -c o -m ${'g' if gpu else 'c'}
+cd "${MFC_ROOT_DIR}"
+. ./mfc.sh load -c o -m ${'g' if gpu_enabled else 'c'}
 cd - > /dev/null
 echo
 
@@ -42,9 +42,8 @@ echo
     % if not mpi:
         (set -x; ${profiler} "${target.get_install_binpath(case)}")
     % else:
-        (set -x; ${profiler}    \
-            mpirun -np ${nodes*tasks_per_node}                 \
-                   ${' '.join([f"'{x}'" for x in ARG('--') ])} \
+        (set -x; ${profiler}                              \
+            srun                                          \
                    "${target.get_install_binpath(case)}")
     % endif
 

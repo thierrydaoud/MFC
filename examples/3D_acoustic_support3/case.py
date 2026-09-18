@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import json, math
+import json
+import math
 
 # Configuring case dictionary
 print(
@@ -8,11 +9,11 @@ print(
             # Logistics
             "run_time_info": "T",
             # Computational Domain Parameters
-            "x_domain%beg": 0,
+            "x_domain%beg": 0.0,
             "x_domain%end": 0.001,
-            "y_domain%beg": 0,
+            "y_domain%beg": 0.0,
             "y_domain%end": 0.001,
-            "z_domain%beg": 0,
+            "z_domain%beg": 0.0,
             "z_domain%end": 0.001,
             "m": 49,
             "n": 49,
@@ -23,21 +24,21 @@ print(
             "t_step_save": 5,
             # Simulation Algorithm Parameters
             "num_patches": 1,
-            "model_eqns": 2,
+            "model_eqns": "5eq",
             "alt_soundspeed": "F",
             "num_fluids": 1,
             "mpp_lim": "F",
             "mixture_err": "F",
-            "time_stepper": 3,
+            "time_stepper": "rk3",
             "weno_order": 5,
             "weno_eps": 1.0e-16,
             "teno": "T",
             "teno_CT": 1e-8,
             "null_weights": "F",
             "mp_weno": "F",
-            "riemann_solver": 2,
-            "wave_speeds": 1,
-            "avg_state": 2,
+            "riemann_solver": "hllc",
+            "wave_speeds": "direct",
+            "avg_state": "arithmetic",
             "bc_x%beg": -6,
             "bc_x%end": -6,
             "bc_y%beg": -6,
@@ -45,8 +46,8 @@ print(
             "bc_z%beg": -6,
             "bc_z%end": -6,
             # Formatted Database Files Structure Parameters
-            "format": 1,
-            "precision": 2,
+            "format": "silo",
+            "precision": "double",
             "prim_vars_wrt": "T",
             "parallel_io": "T",
             # Patch 1 Liquid
@@ -79,6 +80,7 @@ print(
             "acoustic(1)%delay": 1e-7,
             # Fluids Physical Parameters
             "fluid_pp(1)%gamma": 1.0e00 / (4.4e00 - 1.0e00),
+            "fluid_pp(1)%eos": "stiffened_gas",
             "fluid_pp(1)%pi_inf": 4.4e00 * 5.57e08 / (4.4e00 - 1.0e00),
         }
     )

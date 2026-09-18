@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import math
 import json
+import math
 
 # Numerical setup
 Nx = 999
@@ -27,25 +27,25 @@ print(
             "t_step_save": int(math.ceil(Nt / 10.0)),
             # Simulation Algorithm Parameters
             "num_patches": 2,
-            "model_eqns": 2,
+            "model_eqns": "5eq",
             "alt_soundspeed": "F",
             "num_fluids": 1,
             "mpp_lim": "F",
             "mixture_err": "F",
-            "time_stepper": 3,
+            "time_stepper": "rk3",
             "weno_order": 5,
             "weno_eps": 1.0e-16,
             "mapped_weno": "T",
             "null_weights": "F",
             "mp_weno": "F",
-            "riemann_solver": 2,
-            "wave_speeds": 1,
-            "avg_state": 2,
+            "riemann_solver": "hllc",
+            "wave_speeds": "direct",
+            "avg_state": "arithmetic",
             "bc_x%beg": -3,
             "bc_x%end": -3,
             # Formatted Database Files Structure Parameters
-            "format": 1,
-            "precision": 2,
+            "format": "silo",
+            "precision": "double",
             "prim_vars_wrt": "T",
             "parallel_io": "F",
             # Patch 1 L (-5 < x < -4.5)
@@ -62,11 +62,12 @@ print(
             "patch_icpp(2)%length_x": 9.5,
             "patch_icpp(2)%vel(1)": 0.0,
             "patch_icpp(2)%pres": 1.0,
-            "patch_icpp(2)%alpha_rho(1)": "1 + 0.1*sin(20*x*pi)",
+            "patch_icpp(2)%alpha_rho(1)": 0.0,
+            "patch_icpp(2)%hcid": 181,
             "patch_icpp(2)%alpha(1)": 1.0,
             # Fluids Physical Parameters
             "fluid_pp(1)%gamma": 1.0e00 / (1.4 - 1.0e00),
-            "fluid_pp(1)%pi_inf": 0.0,
+            "fluid_pp(1)%eos": "ideal_gas",
         }
     )
 )

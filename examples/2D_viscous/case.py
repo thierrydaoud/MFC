@@ -3,8 +3,8 @@
 # Dependencies and Logistics
 # Command to navigate between directories
 
-import math
 import json
+import math
 
 myeps = 1.4 / 150.0
 
@@ -34,12 +34,12 @@ print(
             "t_step_save": 20,
             # Simulation Algorithm Parameters
             "num_patches": 2,
-            "model_eqns": 2,
+            "model_eqns": "5eq",
             "alt_soundspeed": "F",
             "num_fluids": 2,
             "mpp_lim": "T",
             "mixture_err": "T",
-            "time_stepper": 3,
+            "time_stepper": "rk3",
             "weno_order": 5,
             "weno_eps": 1.0e-16,
             "mapped_weno": "T",
@@ -47,17 +47,17 @@ print(
             "mp_weno": "F",
             "weno_Re_flux": "T",
             "weno_avg": "T",
-            "riemann_solver": 2,
-            "wave_speeds": 1,
-            "avg_state": 2,
+            "riemann_solver": "hllc",
+            "wave_speeds": "direct",
+            "avg_state": "arithmetic",
             "bc_x%beg": -1,
             "bc_x%end": -1,
             "bc_y%beg": -6,
             "bc_y%end": -6,
             "viscous": "T",
             # Formatted Database Files Structure Parameters
-            "format": 1,
-            "precision": 2,
+            "format": "silo",
+            "precision": "double",
             "prim_vars_wrt": "T",
             "parallel_io": "T",
             # Patch 1: Top fluid, water
@@ -90,7 +90,9 @@ print(
             # Fluids Physical Parameters
             "fluid_pp(1)%gamma": 1.0e00 / (4.4e00 - 1.0e00),
             "fluid_pp(2)%gamma": 1.0e00 / (4.4e00 - 1.0e00),
+            "fluid_pp(1)%eos": "stiffened_gas",
             "fluid_pp(1)%pi_inf": 4.4e00 * 6.0e08 / (4.4e00 - 1.0e00),
+            "fluid_pp(2)%eos": "stiffened_gas",
             "fluid_pp(2)%pi_inf": 4.4e00 * 6.0e08 / (4.4e00 - 1.0e00),
             "fluid_pp(1)%Re(1)": 0.0001,
             "fluid_pp(1)%Re(2)": 0.0001,

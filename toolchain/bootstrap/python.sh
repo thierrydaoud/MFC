@@ -29,7 +29,8 @@ if [ -f "$(pwd)/build/venv/bin/activate" ]; then
     fi
 fi
 
-if ! command -v pip3 > /dev/null 2>&1 && [ ! -f "$(pwd)/build/venv/bin/activate" ]; then
+# Only bootstrap pip if we don't already have a venv
+if [ ! -f "$(pwd)/build/venv/bin/activate" ]; then
     # Check whether python3 is in the $PATH / is accessible.
     if ! command -v python3 > /dev/null 2>&1; then
         error "Couldn't find$MAGENTA Python$COLOR_RESET. Please ensure it is discoverable."
@@ -39,26 +40,41 @@ if ! command -v pip3 > /dev/null 2>&1 && [ ! -f "$(pwd)/build/venv/bin/activate"
 
     assert_python_compatible
 
-    get_pip_url="https://bootstrap.pypa.io/pip/get-pip.py"
+    # Check if pip is already available as a Python module
+    # This works on both laptops and HPC systems with module-loaded Python
+    if ! python3 -c "import pip" > /dev/null 2>&1; then
+        warn "$MAGENTA""Python$COLOR_RESET's$MAGENTA PIP$COLOR_RESET is not installed."
+        
+        # Try ensurepip first (standard library, safe)
+        log "Attempting to install pip via ensurepip..."
+        if python3 -m ensurepip --upgrade 2>/dev/null; then
+            ok "Installed pip via ensurepip."
+        else
+            # Fall back to get-pip.py only if ensurepip fails
+            get_pip_url="https://bootstrap.pypa.io/pip/get-pip.py"
+            log "Downloading$MAGENTA Python$COLOR_RESET's$MAGENTA PIP$COLOR_RESET from $get_pip_url..."
 
-    warn "$MAGENTA""Python$COLOR_RESET's$MAGENTA PIP$COLOR_RESET is not installed."
-    log  "Downloading$MAGENTA Python$COLOR_RESET's$MAGENTA PIP$COLOR_RESET from $get_pip_url..."
+            if ! wget -O "$(pwd)/build/get-pip.py" "$get_pip_url"; then
+                error "Couldn't download get-pip.py."
+                exit 1
+            fi
 
-    if ! wget -O "$(pwd)/build/get-pip.py" "$get_pip_url"; then
-        error "Couldn't download get-pip.py."
+            # Suppress PIP version warning (out of date)
+            export PIP_DISABLE_PIP_VERSION_CHECK=1
+            if ! python3 "$(pwd)/build/get-pip.py" --user; then
+                error "Couldn't install$MAGENTA pip$COLOR_RESET with get-pip.py"
+                exit 1
+            fi
 
-        exit 1
+            ok "Installed pip via get-pip.py."
+            
+            # Ensure user-site bin directory is on PATH for this session
+            user_base_bin="$(python3 -m site --user-base)/bin"
+            if [ -d "$user_base_bin" ]; then
+                export PATH="$user_base_bin:$PATH"
+            fi
+        fi
     fi
-
-    # Suppress PIP version warning (out of date)
-    export PIP_DISABLE_PIP_VERSION_CHECK=1
-    if ! python3 "$(pwd)/build/get-pip.py" --user; then
-        error "Couldn't install$MAGENTA pip$COLOR_RESET with get-pip.py"
-
-        exit 1
-    fi
-
-    ok "Installed pip."
 fi
 
 
@@ -113,10 +129,16 @@ ok "(venv) Entered the $MAGENTA$(python3 --version)$COLOR_RESET virtual environm
 # (or)
 # - The pyproject.toml file has changed
 if ! cmp "$(pwd)/toolchain/pyproject.toml" "$(pwd)/build/pyproject.toml" > /dev/null 2>&1; then
-    log "(venv) (Re)Installing mfc.sh's Python dependencies (via Pip)."
+    # Check if this is a fresh install (no previous pyproject.toml in build/)
+    if [ ! -f "$(pwd)/build/pyproject.toml" ]; then
+        log "(venv) Installing$MAGENTA Python packages$COLOR_RESET..."
+    else
+        log "(venv) Updating Python dependencies..."
+    fi
 
     next_arg=0
     nthreads=1
+    verbose=0
     for arg in "$@"; do
         if [ "$arg" == "-j" ] || [ "$arg" == "--jobs" ]; then
             next_arg=1
@@ -127,19 +149,317 @@ if ! cmp "$(pwd)/toolchain/pyproject.toml" "$(pwd)/build/pyproject.toml" > /dev/
             nthreads=$arg
             continue
         fi
+        # Check for verbosity flags
+        if [ "$arg" == "-v" ] || [ "$arg" == "-vv" ] || [ "$arg" == "-vvv" ] || [ "$arg" == "--verbose" ]; then
+            verbose=1
+        fi
     done
 
-    if ! PIP_DISABLE_PIP_VERSION_CHECK=1 MAKEFLAGS=$nthreads pip3 install "$(pwd)/toolchain"; then
-        error "(venv) Installation failed."
+    # Run package installer and show progress
+    PIP_LOG="$(pwd)/build/.pip_install.log"
+
+    # Bootstrap uv if not available (uv is 10-100x faster than pip)
+    # Installing uv itself is quick (~2-3 seconds) and pays off immediately
+    if ! command -v uv > /dev/null 2>&1; then
+        log "(venv) Installing$MAGENTA uv$COLOR_RESET package manager for fast installation..."
+        if PIP_DISABLE_PIP_VERSION_CHECK=1 pip3 install uv > "$PIP_LOG" 2>&1; then
+            ok "(venv) Installed$MAGENTA uv$COLOR_RESET."
+        else
+            # uv install failed, fall back to pip for everything
+            warn "(venv) Could not install uv, falling back to pip (slower)."
+        fi
+    fi
+
+    # Now check if uv is available (either was already installed or we just installed it)
+    USE_UV=0
+    if command -v uv > /dev/null 2>&1; then
+        USE_UV=1
+    fi
+
+    # Use uv if available, otherwise fall back to pip
+    if [ "$USE_UV" = "1" ]; then
+        # UV_LINK_MODE=copy avoids slow hardlink failures on cross-filesystem installs (common on HPC)
+        export UV_LINK_MODE=copy
+        # On GitHub Actions self-hosted runners, the default uv cache (~/.cache/uv)
+        # often lives on a shared NFS $HOME (e.g. OLCF /ccs/home), where uv's
+        # file-lock implementation hits "os error 524" when concurrent runners on
+        # different nodes contend for the same .lock. Redirect to node-local
+        # storage in CI only, so non-CI users keep their normal reusable cache.
+        if [ "${GITHUB_ACTIONS:-}" = "true" ] && [ -w "${TMPDIR:-/tmp}" ]; then
+            export UV_CACHE_DIR="${TMPDIR:-/tmp}/uv-cache-${USER:-$(id -un)}"
+        fi
+
+        # uv's cache (~/.cache/uv by default, or the node-local redirect above
+        # in CI) is shared per-user across every repo/worktree/matrix leg. uv's
+        # own cache lock protects individual entries, but concurrent installs
+        # from separate uv processes can still race while one extracts/prunes
+        # the shared archive-v0 store, leaving a corrupted entry (e.g. a
+        # missing dist-info METADATA file) that fails every subsequent install
+        # until the cache is manually cleared -- both across self-hosted CI
+        # matrix legs (Frontier, Phoenix) sharing a login node, and across
+        # concurrent local builds by the same user. Serialize the install
+        # call itself so only one uv process touches a given cache dir at a
+        # time. Fall back to /tmp for the lock file itself if TMPDIR isn't
+        # writable (e.g. a stale TMPDIR left over from a prior job's
+        # since-deleted scratch dir), so a bad TMPDIR can't break installs
+        # that used to work fine before this lock existed.
+        UV_LOCK_DIR="${TMPDIR:-/tmp}"
+        [ -d "$UV_LOCK_DIR" ] && [ -w "$UV_LOCK_DIR" ] || UV_LOCK_DIR=/tmp
+        UV_INSTALL_LOCK="${UV_LOCK_DIR}/mfc-uv-install-${USER:-$(id -un)}.lock"
+        if command -v flock > /dev/null 2>&1; then
+            uv_install() { flock "$UV_INSTALL_LOCK" uv pip install "$@"; }
+        else
+            uv_install() { uv pip install "$@"; }
+        fi
+
+        # A cache entry corrupted before this lock existed (or by any other
+        # cause) will otherwise fail every subsequent install until someone
+        # notices and clears the cache by hand -- which is exactly what
+        # happened here (a stale corrupted entry on a self-hosted runner kept
+        # failing across multiple PRs before anyone caught it). Self-heal: on
+        # the first failure, clear the cache and retry once before giving up.
+        uv_install_with_retry() {
+            if uv_install "$@"; then
+                return 0
+            fi
+            warn "(venv) uv install failed; clearing the uv cache and retrying once, in case a corrupted cache entry is the cause..."
+            uv cache clean > /dev/null 2>&1 || true
+            uv_install "$@"
+        }
+        log "(venv) Using$MAGENTA uv$COLOR_RESET for fast installation..."
+
+        if [ "$verbose" = "1" ]; then
+            # Verbose mode: show full uv output
+            if uv_install_with_retry "$(pwd)/toolchain"; then
+                ok "(venv) Installation succeeded."
+                cp "$(pwd)/toolchain/pyproject.toml" "$(pwd)/build/"
+            else
+                error "(venv) Installation failed."
+                log "(venv) Exiting the$MAGENTA Python$COLOR_RESET virtual environment."
+                deactivate
+                exit 1
+            fi
+        else
+            # Default: show progress but filter out individual package lines (+ pkg==ver)
+            uv_install_with_retry "$(pwd)/toolchain" > "$PIP_LOG" 2>&1
+            UV_EXIT=$?
+            # Show filtered output (progress info without package list)
+            # Filter out lines like " + pkg==1.0", " - pkg==1.0", " ~ pkg==1.0"
+            grep -v '^ [+~-] ' "$PIP_LOG" || true
+            if [ $UV_EXIT -eq 0 ]; then
+                rm -f "$PIP_LOG"
+                ok "(venv) Installation succeeded."
+                cp "$(pwd)/toolchain/pyproject.toml" "$(pwd)/build/"
+            else
+                error "(venv) Installation failed. Full output:"
+                echo ""
+                cat "$PIP_LOG"
+                echo ""
+                log "(venv) Exiting the$MAGENTA Python$COLOR_RESET virtual environment."
+                deactivate
+                rm -f "$PIP_LOG"
+                exit 1
+            fi
+        fi
+    else
+        # Fall back to pip (slower, show progress bar)
+        PIP_DISABLE_PIP_VERSION_CHECK=1 MAKEFLAGS=$nthreads pip3 install "$(pwd)/toolchain" > "$PIP_LOG" 2>&1 &
+        PIP_PID=$!
+    fi
+
+    # Only run progress bar for pip (uv handles its own output and already completed above)
+    if [ "$USE_UV" = "0" ]; then
+
+    # Check if we're in an interactive terminal
+    if [ -t 1 ]; then
+        IS_TTY=1
+    else
+        IS_TTY=0
+    fi
+
+    # Progress bar configuration
+    # Two phases: Collecting (60%) and Installing (40%)
+    TOTAL_PKGS=70  # Initial estimate, adjusts dynamically
+    BAR_WIDTH=30
+    LAST_MILESTONE=0
+    LAST_PHASE=""
+    START_TIME=$SECONDS
+    FIRST_PRINT=1
+
+    while kill -0 $PIP_PID 2>/dev/null; do
+        # Determine current phase and count from log
+        PHASE="resolving"
+        COUNT=0
+        BUILD_COUNT=0
+        CURRENT_PKG=""
+
+        if [ -f "$PIP_LOG" ]; then
+            # Count packages being collected (dependency resolution)
+            COUNT=$(grep -c "^Collecting" "$PIP_LOG" 2>/dev/null | tr -d '[:space:]')
+            COUNT=${COUNT:-0}
+            if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
+                COUNT=0
+            fi
+
+            # Count wheels being built
+            BUILD_COUNT=$(grep -c "Building wheel" "$PIP_LOG" 2>/dev/null | tr -d '[:space:]')
+            BUILD_COUNT=${BUILD_COUNT:-0}
+            if ! [[ "$BUILD_COUNT" =~ ^[0-9]+$ ]]; then
+                BUILD_COUNT=0
+            fi
+
+            # Check if we're in the installing phase
+            if grep -q "Installing collected packages" "$PIP_LOG" 2>/dev/null; then
+                PHASE="installing"
+            elif [ "$BUILD_COUNT" -gt 0 ]; then
+                PHASE="building"
+            fi
+
+            # Extract the current package being processed
+            CURRENT_LINE=$(grep -E "^Collecting |^  Downloading |^  Building wheel for " "$PIP_LOG" 2>/dev/null | tail -1)
+            if [[ "$CURRENT_LINE" == Collecting* ]]; then
+                # "Collecting numpy>=1.21.0" -> "numpy"
+                CURRENT_PKG=$(echo "$CURRENT_LINE" | sed 's/^Collecting //; s/[<>=\[( ].*//; s/\[.*//')
+            elif [[ "$CURRENT_LINE" == *Downloading* ]]; then
+                # "  Downloading numpy-1.24.0-cp312..." -> "numpy"
+                CURRENT_PKG=$(echo "$CURRENT_LINE" | sed 's/.*Downloading //; s/-[0-9].*//')
+            elif [[ "$CURRENT_LINE" == *"Building wheel"* ]]; then
+                # "  Building wheel for numpy (pyproject.toml)" -> "numpy"
+                CURRENT_PKG=$(echo "$CURRENT_LINE" | sed 's/.*Building wheel for //; s/ .*//')
+            fi
+        fi
+
+        ELAPSED=$((SECONDS - START_TIME))
+
+        if [ "$IS_TTY" = "1" ]; then
+            # Calculate progress based on phase
+            # Phase 1 (0-60%): Collecting dependencies
+            # Phase 2 (60-80%): Building wheels
+            # Phase 3 (80-100%): Installing
+
+            if [ "$COUNT" -gt "$TOTAL_PKGS" ]; then
+                TOTAL_PKGS=$COUNT
+            fi
+
+            if [ "$PHASE" = "installing" ]; then
+                PERCENT=90
+                STATUS="Installing..."
+            elif [ "$PHASE" = "building" ]; then
+                # During building, progress from 60-80%
+                PERCENT=$((60 + BUILD_COUNT * 2))
+                if [ "$PERCENT" -gt 80 ]; then
+                    PERCENT=80
+                fi
+                STATUS="Building ($BUILD_COUNT wheels)"
+            else
+                # During collecting, progress from 0-60%
+                PERCENT=$((COUNT * 60 / TOTAL_PKGS))
+                STATUS="$COUNT packages"
+            fi
+
+            FILLED=$((PERCENT * BAR_WIDTH / 100))
+            EMPTY=$((BAR_WIDTH - FILLED))
+
+            # Build the bar with Unicode blocks
+            BAR=""
+            for ((i=0; i<FILLED; i++)); do BAR="${BAR}█"; done
+            for ((i=0; i<EMPTY; i++)); do BAR="${BAR}░"; done
+
+            # Format time
+            MINS=$((ELAPSED / 60))
+            SECS=$((ELAPSED % 60))
+            if [ "$MINS" -gt 0 ]; then
+                TIME_STR="${MINS}m${SECS}s"
+            else
+                TIME_STR="${SECS}s"
+            fi
+
+            # Truncate package name if too long
+            if [ ${#CURRENT_PKG} -gt 40 ]; then
+                CURRENT_PKG="${CURRENT_PKG:0:37}..."
+            fi
+
+            # Print progress bar and current package on two lines
+            # First time: just print. After that: move up one line first
+            if [ "$FIRST_PRINT" = "1" ]; then
+                FIRST_PRINT=0
+            else
+                printf "\033[1A"  # Move cursor up one line
+            fi
+            printf "\r  ${CYAN}│${BAR}│${COLOR_RESET} %3d%% (%s, %s)            \n" "$PERCENT" "$STATUS" "$TIME_STR"
+            printf "  ${MAGENTA}→${COLOR_RESET} %-45s\r" "${CURRENT_PKG:-starting...}"
+        else
+            # Non-interactive: print milestone updates and phase changes
+            if [ "$PHASE" != "$LAST_PHASE" ]; then
+                case "$PHASE" in
+                    "building")
+                        log "(venv) Building wheels..."
+                        ;;
+                    "installing")
+                        log "(venv) Installing packages..."
+                        ;;
+                esac
+                LAST_PHASE="$PHASE"
+            fi
+
+            if [ "$PHASE" = "resolving" ]; then
+                MILESTONE=$((COUNT / 20 * 20))
+                if [ "$MILESTONE" -gt "$LAST_MILESTONE" ] && [ "$MILESTONE" -gt 0 ]; then
+                    LAST_MILESTONE=$MILESTONE
+                    log "(venv) Resolving: ~$COUNT packages..."
+                fi
+            fi
+        fi
+
+        sleep 0.3
+    done
+
+    # Wait for pip to finish and get exit code
+    wait $PIP_PID
+    PIP_EXIT=$?
+
+    # Clear the progress lines if in terminal (2 lines: progress bar + current package)
+    if [ "$IS_TTY" = "1" ]; then
+        printf "\033[1A"           # Move up one line
+        printf "\r%60s\n" " "      # Clear progress bar line
+        printf "\r%60s\r" " "      # Clear current package line
+        printf "\033[1A"           # Move back up
+    fi
+
+    if [ $PIP_EXIT -ne 0 ]; then
+        error "(venv) Installation failed. See output below:"
+        echo ""
+        cat "$PIP_LOG"
+        echo ""
 
         log   "(venv) Exiting the$MAGENTA Python$COLOR_RESET virtual environment."
         deactivate
-
+        rm -f "$PIP_LOG"
         exit 1
     fi
 
+    rm -f "$PIP_LOG"
     ok "(venv) Installation succeeded."
 
     # Save the new/current pyproject.toml
     cp "$(pwd)/toolchain/pyproject.toml" "$(pwd)/build/"
+
+    fi  # end of USE_UV=0 (pip) block
+fi
+
+
+# Apply patches to installed packages.
+# fypp: always emit a resync linemarker after single-line $: macro calls so
+# that the compiler attributes the following Fortran statement to the correct
+# source line rather than the call-site line (off-by-1 in backtraces).
+FYPP_PY="$(python3 -c "import fypp; print(fypp.__file__)" 2>/dev/null)"
+FYPP_PATCH="$(pwd)/toolchain/patches/fypp-linemarker-resync.patch"
+if [ -n "$FYPP_PY" ] && [ -f "$FYPP_PATCH" ]; then
+    if ! grep -q "Always emit a resync marker" "$FYPP_PY" 2>/dev/null; then
+        if patch -p1 --forward --silent "$FYPP_PY" < "$FYPP_PATCH" 2>/dev/null; then
+            ok "(venv) Applied$MAGENTA fypp$COLOR_RESET linemarker-resync patch."
+        else
+            warn "(venv) Failed to apply$MAGENTA fypp$COLOR_RESET linemarker-resync patch (fypp version may have changed)."
+        fi
+    fi
 fi

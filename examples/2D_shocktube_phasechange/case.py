@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-import math, json
+import argparse
+import json
+import math
 
-## 1 FOR BACKGROUND, 2 FOR SHOKED STATE, 3 FOR WATER REGION (WHEN NEEDED)
+parser = argparse.ArgumentParser(prog="phasechange", description="phase change considering both 5 and 6 equation models.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser.add_argument("--mfc", type=json.loads, default="{}", metavar="DICT", help="MFC's toolchain's internal state.")
+parser.add_argument("-me", "--model_eqns", type=int, metavar="MODEL EQN", choices=[2, 3], default=3, help="choose `2' for 5-equation model or `3' for 6-equation model.")
+args = parser.parse_args()
+
+# 1 FOR BACKGROUND, 2 FOR SHOKED STATE, 3 FOR WATER REGION (WHEN NEEDED)
 # Pressure
 p01 = 1.0843e05
 p02 = 2.1114e05
 p03 = 1.0685e05
 
-## FLUID PROPERTIES FOR EACH PATCH
+# FLUID PROPERTIES FOR EACH PATCH
 
-## liquid water
+# liquid water
 
 # pi infty
 piwl = 1.0e09
@@ -38,7 +45,7 @@ awl3 = 6.5969e-03
 c_wl1 = math.sqrt(gamwl * (p01 + piwl) / rho0wl1)
 c_wl2 = math.sqrt(gamwl * (p02 + piwl) / rho0wl2)
 
-## Vapor water
+# Vapor water
 
 # pi infinity
 piwv = 0
@@ -96,7 +103,7 @@ aa3 = 1 - awl3 - awv3
 c_a1 = math.sqrt(gama * (p01 + pia) / rho0a1)
 c_a2 = math.sqrt(gama * (p02 + pia) / rho0a2)
 
-## SHOCK RELATIONS
+# SHOCK RELATIONS
 p02Op01 = p02 / p01
 
 # Mach number of the shocked region - this should agree with Min, if everything is correct
@@ -105,7 +112,7 @@ Ms = math.sqrt((gama + 1.0) / (2.0 * gama) * (p02Op01 - 1.0) * (p02 / (p02 + pia
 # shock speed
 ss = Ms * c_a1
 
-## SIMULATION PARAMETERS
+# SIMULATION PARAMETERS
 
 # CFL
 cfl = 0.25
@@ -173,7 +180,7 @@ print(
             "t_step_save": AS,
             # Simulation Algorithm Parameters
             "num_patches": 3,
-            "model_eqns": 3,
+            "model_eqns": args.model_eqns,
             "num_fluids": 3,
             "mpp_lim": "T",
             "mixture_err": "T",
@@ -181,22 +188,22 @@ print(
             "relax_model": 6,
             "palpha_eps": 1.0e-2,
             "ptgalpha_eps": 1.0e-2,
-            "time_stepper": 3,
+            "time_stepper": "rk3",
             "weno_order": 3,
             "weno_eps": 1.0e-16,
             "mapped_weno": "T",
             "null_weights": "F",
             "mp_weno": "F",
-            "riemann_solver": 2,
-            "wave_speeds": 1,
-            "avg_state": 2,
+            "riemann_solver": "hllc",
+            "wave_speeds": "direct",
+            "avg_state": "arithmetic",
             "bc_x%beg": -6,
             "bc_x%end": -6,
             "bc_y%beg": -2,
             "bc_y%end": -6,
             # Formatted Database Files Structure Parameters
-            "format": 1,
-            "precision": 2,
+            "format": "silo",
+            "precision": "double",
             "prim_vars_wrt": "T",
             "parallel_io": "T",
             # Patch 1 - Background
@@ -248,16 +255,19 @@ print(
             "patch_icpp(3)%alter_patch(1)": "T",
             # Fluids Physical Parameters
             "fluid_pp(1)%gamma": 1.0e00 / (gamwl - 1),
+            "fluid_pp(1)%eos": "stiffened_gas",
             "fluid_pp(1)%pi_inf": gamwl * piwl / (gamwl - 1),
             "fluid_pp(1)%cv": cvwl,
             "fluid_pp(1)%qv": qvwl,
             "fluid_pp(1)%qvp": qvpwl,
             "fluid_pp(2)%gamma": 1.0e00 / (gamwv - 1),
+            "fluid_pp(2)%eos": "stiffened_gas",
             "fluid_pp(2)%pi_inf": gamwv * piwv / (gamwv - 1),
             "fluid_pp(2)%cv": cvwv,
             "fluid_pp(2)%qv": qvwv,
             "fluid_pp(2)%qvp": qvpwv,
             "fluid_pp(3)%gamma": 1.0e00 / (gama - 1),
+            "fluid_pp(3)%eos": "stiffened_gas",
             "fluid_pp(3)%pi_inf": gama * pia / (gama - 1),
             "fluid_pp(3)%cv": cva,
             "fluid_pp(3)%qv": qva,

@@ -1,0 +1,3059 @@
+"""
+MFC Case Parameter Constraint Validator
+
+Validates inter-parameter dependencies and constraints before running
+the Fortran codes. This catches configuration errors early and provides
+user-friendly error messages.
+
+Based on the constraints enforced in:
+- src/common/m_checker_common.fpp
+- src/pre_process/m_checker.fpp
+- src/simulation/m_checker.fpp
+- src/post_process/m_checker.fpp
+"""
+
+import math
+import re
+from functools import lru_cache
+from typing import Any, Dict, List, Set
+
+from . import eos
+from .common import MFCException
+from .params.definitions import CONSTRAINTS
+from .params.namelist_parser import get_fortran_constants
+from .state import CFG
+
+# Above this the Ensemble-Averaged Bubble Model's O(alpha) expansion, which enters the closure as
+# 1/(1 - alpha), is outside the dilute limit it is derived in (MFlowCode/MFC#1793).
+DILUTE_VOID_FRACTION_MAX = 0.1
+
+# Physics documentation for check methods.
+# Each entry maps a check method name to metadata used by gen_physics_docs.py
+# to auto-generate docs/documentation/physics_constraints.md.
+# See the contributing guide for how to add entries.
+PHYSICS_DOCS = {
+    "check_inflow_ramp": {
+        "title": "GRCBC Inflow Ramp",
+        "category": "Boundary Conditions",
+        "math": r"f(t) = f_0 + (1 - f_0)\left[1 + \tanh\left(6 (t - t_0)/\tau - 3\right)\right]/2",
+        "explanation": "A ramped inflow scales the inflow velocity from a fraction f_0 of its final value to "
+        "that value over a duration tau. It requires grcbc_in to act on, a non-negative duration, and f_0 in [0, 1].",
+    },
+    # Thermodynamic Constraints
+    "check_stiffened_eos": {
+        "title": "Stiffened EOS Positivity",
+        "category": "Thermodynamic Constraints",
+        "math": r"\Gamma > 0, \quad \Pi_\infty \geq 0, \quad c_v \geq 0",
+        "explanation": "The equation-of-state parameters must satisfy basic positivity requirements for thermodynamic stability.",
+        "references": ["Wilfong26"],
+    },
+    "_check_initial_states_inside_eos": {
+        "title": "Initial States Inside a State-Dependent Equation of State",
+        "category": "Thermodynamic Constraints",
+        "math": r"\rho e = \Gamma p + \Pi(\rho) > 0, \quad \Gamma c^2 = \frac{(\Gamma + 1) p + \Pi}{\rho} - \Pi' - p\,\Gamma' > 0",
+        "explanation": (
+            "A reference-curve EOS is only defined where the internal energy and the sound speed it implies are positive; "
+            "outside that region the solver has no clamp and produces NaNs. Every patch is checked at the state it starts "
+            "each state-dependent fluid in."
+        ),
+        "references": [],
+    },
+    "check_eos_selector": {
+        "title": "Equation of State Selector",
+        "category": "Thermodynamic Constraints",
+        "math": r"\rho e = \Gamma\,p + \Pi(\rho), \quad \Gamma = 1/\Gamma_G, \quad \Pi(\rho) = \rho\, e_{\mathrm{ref}}(\rho) - p_{\mathrm{ref}}(\rho)/\Gamma_G",
+        "explanation": (
+            "Every backend supplies the same two coefficients, and a case may only set the parameters its backend reads: an "
+            "ideal gas has no pi_inf, and a state-dependent fluid (mie_gruneisen, jwl, vinet) has neither gamma nor pi_inf; qv stays "
+            "a formation energy shared by every family. A family's parameters are read only when that family is selected, and a "
+            "temperature (T_wrt, or an Arrhenius burn rate) needs the reference temperature *_t0 as well as cv. The initial state "
+            "of every patch must lie inside the equation of state (rho e > 0 and c^2 > 0). The features a state-dependent fluid "
+            "is refused with still read stiffened-gas coefficients directly."
+        ),
+        "references": ["Wilfong26"],
+    },
+    "check_eos_parameter_sanity": {
+        "title": "EOS Parameter Sanity (Transformed Gamma)",
+        "category": "Thermodynamic Constraints",
+        "math": r"\Gamma = \frac{1}{\gamma - 1}",
+        "explanation": ("MFC uses the transformed stiffened gas parameter. A common mistake is entering the physical gamma (e.g., 1.4 for air) instead of the transformed value 1/(gamma-1) = 2.5."),
+        "references": ["Wilfong26", "Allaire02"],
+    },
+    "check_patch_physics": {
+        "title": "Patch Initial Condition Constraints",
+        "category": "Thermodynamic Constraints",
+        "math": r"p > 0, \quad \alpha_i \rho_i \geq 0, \quad 0 \leq \alpha_i \leq 1",
+        "explanation": ("All initial patch pressures must be strictly positive. Partial densities must be non-negative. Volume fractions must be in [0,1]."),
+    },
+    # Mixture Constraints
+    "check_volume_fraction_sum": {
+        "title": "Volume Fraction Sum",
+        "category": "Mixture Constraints",
+        "math": r"\sum_{i=1}^{N_f} \alpha_i = 1",
+        "explanation": "For multi-component models, volume fractions must satisfy the mixture constraint.",
+        "exceptions": [
+            "Single-fluid Euler-Euler bubble models (alpha represents void fraction)",
+            "Lagrangian bubble models (Lagrangian phase not tracked on Euler grid)",
+            "IBM cases (alpha acts as level-set indicator)",
+            "Alter patches and hard-coded IC patches (values computed at runtime)",
+            "Analytical expressions (cannot validate statically)",
+        ],
+    },
+    "check_alpha_rho_consistency": {
+        "title": "Alpha-Rho Consistency",
+        "category": "Mixture Constraints",
+        "math": r"\alpha_j = 0 \Rightarrow \alpha_j \rho_j = 0, \quad \alpha_j > 0 \Rightarrow \alpha_j \rho_j > 0",
+        "explanation": ("Warns about physically inconsistent combinations: density assigned to an absent phase, or a present phase with zero density."),
+    },
+    # Domain and Geometry
+    "check_domain_bounds": {
+        "title": "Domain Bounds",
+        "category": "Domain and Geometry",
+        "math": r"x_{\mathrm{end}} > x_{\mathrm{beg}}, \quad y_{\mathrm{end}} > y_{\mathrm{beg}}, \quad z_{\mathrm{end}} > z_{\mathrm{beg}}",
+        "explanation": "Each active spatial dimension must have positive extent.",
+    },
+    "check_simulation_domain": {
+        "title": "Dimensionality",
+        "category": "Domain and Geometry",
+        "math": r"m > 0, \quad n \geq 0, \quad p \geq 0",
+        "explanation": ("The x-direction must have cells. Cannot have z without y. Cylindrical coordinates require odd p."),
+    },
+    "check_domain_extents": {
+        "title": "Domain Extents Specified",
+        "category": "Domain and Geometry",
+        "math": r"m > 0 \Rightarrow x_{\mathrm{beg}}, x_{\mathrm{end}} \ \mathrm{set}",
+        "explanation": (
+            "Every dimension that has cells needs its physical extents so that the grid can be generated. Skipped on restarts (old_grid = T), where the mesh is read from the existing grid files."
+        ),
+    },
+    "check_patch_within_domain": {
+        "title": "Patch Within Domain",
+        "category": "Domain and Geometry",
+        "explanation": ("For patches with centroid + length geometry, the bounding box must not be entirely outside the computational domain. Skipped when grid stretching is active."),
+    },
+    # Velocity and Dimensional Consistency
+    "check_velocity_components": {
+        "title": "Velocity Components in Inactive Dimensions",
+        "category": "Velocity and Dimensional Consistency",
+        "math": r"n = 0 \Rightarrow v_2 = 0, \quad p = 0 \Rightarrow v_3 = 0",
+        "explanation": "Setting velocity components in dimensions that do not exist is almost certainly a mistake.",
+        "exceptions": ["MHD simulations (transverse velocity couples to magnetic field in 1D)"],
+    },
+    # Model Equations
+    "check_model_eqns_and_num_fluids": {
+        "title": "Model Equation Selection",
+        "category": "Model Equations",
+        "explanation": ("Model 1: gamma-law single-fluid. Model 2: five-equation (Allaire). Model 3: six-equation (Saurel). Model 4: four-equation (single-component with bubbles)."),
+        "references": ["Wilfong26", "Allaire02", "Saurel09"],
+    },
+    # Boundary Conditions
+    "check_boundary_conditions": {
+        "title": "Boundary Condition Compatibility",
+        "category": "Boundary Conditions",
+        "explanation": ("Periodicity must match on both ends. Valid BC values range from -1 to -17. Cylindrical coordinates have specific BC requirements at the axis."),
+    },
+    # Bubble Physics
+    "check_bubbles_euler": {
+        "title": "Euler-Euler Bubble Model",
+        "category": "Bubble Physics",
+        "math": r"\Gamma_l\,p_l = \frac{1}{1-\alpha}\left(E - \tfrac{1}{2}\rho|\mathbf{u}|^2\right) - \Pi_{\infty,l}",
+        "explanation": (
+            "Requires nb >= 1, positive reference quantities. Polydisperse requires odd nb > 1 and poly_sigma > 0. "
+            "QBMM requires nnode = 4. The closure is written for a single carrier liquid, whose own coefficients "
+            "enter undiluted with the void fraction appearing only as the 1/(1 - alpha) on the energy, so "
+            "num_fluids <= 2 (the last advection slot being the void)."
+        ),
+        "references": ["Bryngelson21"],
+    },
+    "check_bubbles_euler_simulation": {
+        "title": "Bubble Simulation Constraints",
+        "category": "Bubble Physics",
+        "explanation": ("Requires HLLC Riemann solver and arithmetic average. Five-equation model does not support Gilmore bubble_model."),
+    },
+    "check_bubbles_lagrange": {
+        "title": "Euler-Lagrange Bubble Model",
+        "category": "Bubble Physics",
+        "explanation": "2D/3D only. Requires polytropic = F and thermal = 3. Not compatible with model_eqns = 3. Kahan summation not compatible with --mixed precision.",
+    },
+    "check_reactive_burn": {
+        "title": "Condensed-Phase Reactive Burn",
+        "category": "Combustion",
+        "explanation": (
+            "Programmed pressure-driven burn converting a reactant fluid to a product fluid on the multi-fluid model. "
+            "Requires model_eqns = 2 or 3 and num_fluids = 2 (reactant, product) sharing the stiffened-gas EOS "
+            "(equal gamma, pi_inf) with qv_reactant > qv_product. rburn%k (> 0), rburn%pign, rburn%pref (> 0), "
+            "and rburn%n (>= 0) must all be set. rburn%ta (activation temperature [K]) is optional and must be >= 0; "
+            ">0 adds an Arrhenius exp(-rburn%ta/T) factor and requires fluid_pp(1)%cv > 0."
+        ),
+    },
+    # Numerical Schemes
+    "check_weno": {
+        "title": "WENO Reconstruction",
+        "category": "Numerical Schemes",
+        "explanation": ("weno_order must be 1, 3, 5, or 7. Grid must have enough cells. Only one of mapped_weno, wenoz, teno can be active."),
+    },
+    "check_muscl": {
+        "title": "MUSCL Reconstruction",
+        "category": "Numerical Schemes",
+        "explanation": "muscl_order must be 1 or 2. Second order requires muscl_lim in {0,1,2,3,4,5}.",
+    },
+    "check_time_stepping": {
+        "title": "Time Stepping",
+        "category": "Numerical Schemes",
+        "explanation": ("time_stepper in {1,2,3}. Fixed dt must be positive. CFL-based modes require cfl_target in (0,1]."),
+    },
+    "check_viscosity": {
+        "title": "Viscosity",
+        "category": "Numerical Schemes",
+        "math": r"\mathrm{Re}_1 > 0, \quad \mathrm{Re}_2 > 0",
+        "explanation": "Reynolds numbers must be positive. Not supported with model_eqns = 1.",
+    },
+    # Feature Compatibility
+    "check_mhd": {
+        "title": "Magnetohydrodynamics (MHD)",
+        "category": "Feature Compatibility",
+        "explanation": (
+            "Requires model_eqns = 2, num_fluids = 1, HLL or HLLD Riemann solver. No relativity with HLLD. "
+            "The relativistic enthalpy h = 1 + (Gamma + 1)p/rho carries no stiffness, so relativity requires pi_inf = 0."
+        ),
+    },
+    "check_surface_tension": {
+        "title": "Surface Tension",
+        "category": "Feature Compatibility",
+        "explanation": "Requires model_eqns 2 or 3, num_fluids = 2.",
+    },
+    "check_hypoelasticity": {
+        "title": "Hypoelasticity",
+        "category": "Feature Compatibility",
+        "explanation": "Requires model_eqns = 2, HLL/HLLC/HLLD Riemann solver.",
+    },
+    "check_phase_change": {
+        "title": "Phase Change",
+        "category": "Feature Compatibility",
+        "explanation": "Model 2: relax_model 5 or 6. Model 3: relax_model 1, 4, 5, or 6.",
+    },
+    "check_alt_soundspeed": {
+        "title": "Alternative Sound Speed",
+        "category": "Feature Compatibility",
+        "explanation": "Requires model_eqns = 2, exactly two fluid components, HLL/HLLC/HLLD solver. Incompatible with bubbles.",
+    },
+    "check_igr": {
+        "title": "Iterative Generalized Riemann (IGR)",
+        "category": "Feature Compatibility",
+        "explanation": ("Requires model_eqns = 2. Incompatible with characteristic BCs, bubbles, MHD, and elastic models."),
+    },
+    "check_non_newtonian": {
+        "title": "Non-Newtonian (Herschel-Bulkley) Viscosity",
+        "category": "Feature Compatibility",
+        "math": r"\tau = (\tau_0 + K \dot{\gamma}^n) \hat{e}, \quad \mu_{\rm eff} \in [\mu_{\min}, \mu_{\max}]",
+        "explanation": (
+            "Per-fluid Herschel-Bulkley shear-dependent viscosity. "
+            "Requires viscous=T, model_eqns 2 or 3, riemann_solver 1 (HLL) or 2 (HLLC), "
+            "and K, nn, mu_max to be set. "
+            "When tau0 > 0, hb_m (Papanastasiou regularization) must also be set. "
+            "K, nn, mu_max must be positive; mu_min and hb_m must be positive when set; tau0 must be non-negative. "
+            "Re(2) and mu_bulk (bulk viscosity) are rejected for non-Newtonian fluids, "
+            "and HB parameters are rejected on fluids without non_newtonian=T. "
+            "Incompatible with igr."
+        ),
+        "references": ["Papanastasiou87"],
+        "docs_section": "sec-non-newtonian",
+    },
+    # Forcing
+    "check_synthetic_turbulence": {
+        "title": "Synthetic Turbulence Forcing",
+        "category": "Feature Compatibility",
+        "explanation": (
+            "num_turbulent_sources must be > 0 and <= num_turb_sources_max. Each active forcing zone i needs "
+            "turb_pos(i,d) set and synth_L(i,d) > 0 for every active dimension d (d = 1..num_dims); components "
+            "beyond num_dims are unused and not required."
+        ),
+    },
+    # Acoustic Sources
+    "check_acoustic_source": {
+        "title": "Acoustic Sources",
+        "category": "Acoustic Sources",
+        "explanation": ("Dimension-specific support types. Pulse type in {1,2,3,4}. Non-planar sources require foc_length and aperture."),
+    },
+    # IC Extrusion
+    "check_ic_extrusion": {
+        "title": "IC Extrusion File Parameters",
+        "category": "IC Extrusion",
+        "explanation": "Extrusion hcids (170, 270, 271, 272, 370, 371) read initial condition data from files. Both files_dir and file_extension must be set.",
+    },
+    # Post-Processing
+    "check_vorticity": {
+        "title": "Vorticity Output",
+        "category": "Post-Processing",
+        "explanation": "omega_wrt requires at least 2D (n > 0). 3D components require p > 0. Requires fd_order.",
+    },
+    "check_fft": {
+        "title": "FFT Output",
+        "category": "Post-Processing",
+        "explanation": ("Requires 3D with all periodic boundaries. Global dimensions must be even. Incompatible with cylindrical coordinates."),
+    },
+}
+
+
+@lru_cache(maxsize=1)
+def _get_logical_params_from_registry() -> Set[str]:
+    """
+    Get all LOG-type parameter names from the registry.
+
+    This replaces the hardcoded logical_params list with a dynamic lookup,
+    ensuring all LOG parameters are validated without manual maintenance.
+
+    Returns:
+        Set of parameter names that have LOG type.
+    """
+    from .params import REGISTRY
+    from .params.schema import ParamType
+
+    return {name for name, param in REGISTRY.all_params.items() if param.param_type == ParamType.LOG}
+
+
+class CaseConstraintError(MFCException):
+    """Exception raised when case parameters violate constraints"""
+
+
+class CaseValidator:
+    """Validates MFC case parameter constraints"""
+
+    def __init__(self, params: Dict[str, Any]):
+        self.params = params
+        self.errors: List[str] = []
+        self.warnings: List[str] = []
+
+    def get(self, key: str, default=None):
+        """Get parameter value with default"""
+        return self.params.get(key, default)
+
+    def is_set(self, key: str) -> bool:
+        """Check if parameter is set (not None and present)"""
+        return key in self.params and self.params[key] is not None
+
+    def prohibit(self, condition: bool, message: str):
+        """Assert that condition is False, otherwise add error"""
+        if condition:
+            self.errors.append(message)
+
+    def warn(self, condition: bool, message: str):
+        """Add a non-fatal warning if condition is True"""
+        if condition:
+            self.warnings.append(message)
+
+    def _validate_logical(self, key: str):
+        """Validate that a parameter is a valid Fortran logical ('T' or 'F')."""
+        val = self.get(key)
+        if val is not None and val not in ("T", "F"):
+            self.errors.append(f"{key} must be 'T' or 'F', got '{val}'")
+
+    def _check_order_fits_grid(self, order: int, param_name: str) -> None:
+        """Prohibit reconstruction order that exceeds grid cell count in any active dimension."""
+        m = self.get("m", 0)
+        n = self.get("n", 0) or 0
+        p = self.get("p", 0) or 0
+        self.prohibit(m + 1 < order, f"m must be at least {param_name} - 1 (= {order - 1})")
+        self.prohibit(n > 0 and n + 1 < order, f"For 2D: n must be at least {param_name} - 1 (= {order - 1})")
+        self.prohibit(p > 0 and p + 1 < order, f"For 3D: p must be at least {param_name} - 1 (= {order - 1})")
+
+    def _get_recon_type(self) -> int:
+        return self.get("recon_type", 1)
+
+    def check_parameter_types(self):
+        """Validate parameter types before other checks.
+
+        This catches invalid values early with clear error messages,
+        rather than letting them cause confusing failures later.
+
+        LOG parameters are discovered dynamically from the registry,
+        eliminating the need to maintain a hardcoded list.
+        """
+        # Validate all LOG-type parameters from registry
+        logical_params = _get_logical_params_from_registry()
+        for param in logical_params:
+            if param in self.params:  # Only validate params that are set
+                self._validate_logical(param)
+
+        _recon_constraint = CONSTRAINTS["recon_type"]
+        _recon_choices = _recon_constraint["choices"]
+        _recon_by_value = {v: n for n, v in _recon_constraint.get("names", {}).items()}
+        _recon_shown = ", ".join(f"{c} ({_recon_by_value[c]})" if c in _recon_by_value else str(c) for c in _recon_choices)
+        self.prohibit(
+            self.get("recon_type", 1) not in _recon_choices,
+            f"recon_type must be one of {_recon_shown}",
+        )
+
+    # Common Checks (All Stages)
+
+    def check_simulation_domain(self):
+        """Checks constraints on dimensionality and number of cells"""
+        m = self.get("m")
+        n = self.get("n", 0)
+        p = self.get("p", 0)
+        cyl_coord = self.get("cyl_coord", "F") == "T"
+
+        self.prohibit(m is None, "m must be set")
+        self.prohibit(m is not None and m <= 0, "m must be positive")
+        self.prohibit(n is not None and n < 0, "n must be non-negative")
+        self.prohibit(p is not None and p < 0, "p must be non-negative")
+        self.prohibit(cyl_coord and p is not None and p > 0 and p % 2 == 0, "p must be odd for cylindrical coordinates")
+        self.prohibit(n is not None and p is not None and n == 0 and p > 0, "p must be 0 if n = 0")
+
+    def check_model_eqns_and_num_fluids(self):
+        """Checks constraints on model equations and number of fluids"""
+        model_eqns = self.get("model_eqns")
+        num_fluids = self.get("num_fluids")
+        mpp_lim = self.get("mpp_lim", "F") == "T"
+        cyl_coord = self.get("cyl_coord", "F") == "T"
+        p = self.get("p", 0)
+
+        self.prohibit(model_eqns is not None and model_eqns not in [1, 2, 3], "model_eqns must be 1, 2, or 3")
+        self.prohibit(num_fluids is not None and num_fluids < 1, "num_fluids must be positive")
+        self.prohibit(model_eqns == 1 and num_fluids is not None, "num_fluids is not supported for model_eqns = 1")
+        self.prohibit(model_eqns == 2 and num_fluids is None, "5-equation model (model_eqns = 2) requires num_fluids to be set")
+        self.prohibit(model_eqns == 3 and num_fluids is None, "6-equation model (model_eqns = 3) requires num_fluids to be set")
+        self.prohibit(model_eqns == 1 and mpp_lim, "model_eqns = 1 does not support mpp_lim")
+        self.prohibit(num_fluids == 1 and mpp_lim, "num_fluids = 1 does not support mpp_lim")
+        self.prohibit(model_eqns == 3 and cyl_coord and p != 0, "6-equation model (model_eqns = 3) does not support cylindrical coordinates (cyl_coord = T and p != 0)")
+
+    def check_igr(self):
+        """Checks constraints regarding IGR order"""
+        igr = self.get("igr", "F") == "T"
+        igr_pres_lim = self.get("igr_pres_lim", "F") == "T"
+
+        self.prohibit(igr_pres_lim and not igr, "igr_pres_lim requires igr to be enabled")
+
+        if not igr:
+            return
+
+        # m_igr.fpp discards qv (qv_igr), so a nonzero value would be silently dropped from
+        # the pressure rather than applied.
+        num_fluids = self.get("num_fluids")
+        if num_fluids is not None:
+            for i in range(1, num_fluids + 1):
+                qv = self.get(f"fluid_pp({i})%qv")
+                self.prohibit(qv is not None and qv != 0, f"igr does not support fluid_pp({i})%qv (heat of formation); it is discarded")
+
+        igr_order = self.get("igr_order")
+        self.prohibit(igr_order not in [None, 3, 5], "igr_order must be 3 or 5")
+        if igr_order:
+            self._check_order_fits_grid(igr_order, "igr_order")
+
+    def check_weno(self):
+        """Checks constraints regarding WENO order"""
+        if self._get_recon_type() != 1:
+            return
+
+        for param in ["muscl_order", "muscl_lim"]:
+            self.prohibit(self.is_set(param), f"recon_type = 1 (WENO) is not compatible with {param}")
+
+        weno_order = self.get("weno_order")
+        if weno_order is None:
+            return
+
+        self.prohibit(weno_order not in [1, 3, 5, 7], "weno_order must be 1, 3, 5, or 7")
+        self._check_order_fits_grid(weno_order, "weno_order")
+
+    def check_muscl(self):
+        """Check constraints regarding MUSCL order"""
+        if self._get_recon_type() != 2:
+            return
+
+        for param in ["mapped_weno", "wenoz", "teno", "mp_weno", "weno_avg", "null_weights", "weno_Re_flux"]:
+            self.prohibit(self.get(param) == "T", f"recon_type = 2 (MUSCL) is not compatible with {param} = T")
+        for param in ["wenoz_q", "teno_CT", "weno_eps"]:
+            self.prohibit(self.is_set(param), f"recon_type = 2 (MUSCL) is not compatible with {param}")
+
+        weno_order = self.get("weno_order")
+        self.prohibit(weno_order is not None and weno_order != 0, f"recon_type = 2 (MUSCL) requires weno_order unset or 0, but got {weno_order}")
+
+        muscl_order = self.get("muscl_order")
+        if muscl_order is None:
+            return
+
+        self.prohibit(muscl_order not in [1, 2], "muscl_order must be 1 or 2")
+        self._check_order_fits_grid(muscl_order, "muscl_order")
+
+    def check_interface_compression(self):
+        """Check constraints regarding interface compression"""
+        int_comp = self.get("int_comp", 0)
+        n = self.get("n", 0)
+        num_fluids = self.get("num_fluids", 0)
+        model_eqns = self.get("model_eqns", 2)
+        self.prohibit(int_comp not in [0, 1, 2], "int_comp must be 0 (off), 1 (THINC), or 2 (MTHINC)")
+        self.prohibit(int_comp == 2 and n == 0, "int_comp = 2 (MTHINC) requires at least 2D (n > 0)")
+        self.prohibit(int_comp != 0 and num_fluids != 2, "int_comp > 0 requires num_fluids = 2")
+        self.prohibit(
+            int_comp != 0 and model_eqns == 3,
+            "int_comp > 0 is not supported with model_eqns = 3: THINC does not update per-fluid internal energies, leaving thermodynamically inconsistent face states",
+        )
+
+        recon_type = self.get("recon_type", 1)
+        if recon_type == 1:  # WENO
+            weno_order = self.get("weno_order")
+            self.prohibit(weno_order == 1 and int_comp != 0, "int_comp must be 0 (off) when weno_order = 1")
+        elif recon_type == 2:  # MUSCL
+            muscl_order = self.get("muscl_order")
+            self.prohibit(muscl_order == 1 and int_comp != 0, "int_comp must be 0 (off) when muscl_order = 1")
+
+    def check_boundary_conditions(self):
+        """Checks constraints on boundary conditions"""
+        cyl_coord = self.get("cyl_coord", "F") == "T"
+        m = self.get("m", 0)
+        n = self.get("n", 0)
+        p = self.get("p", 0)
+
+        for dir, var in [("x", "m"), ("y", "n"), ("z", "p")]:
+            var_val = {"m": m, "n": n, "p": p}[var]
+
+            for bound in ["beg", "end"]:
+                bc_key = f"bc_{dir}%{bound}"
+                bc_val = self.get(bc_key)
+
+                self.prohibit(var_val is not None and var_val == 0 and bc_val is not None, f"{bc_key} is not supported for {var} = 0")
+                self.prohibit(var_val is not None and var_val > 0 and bc_val is None, f"{var} != 0 but {bc_key} is not set")
+
+            # Check periodicity matches
+            beg_bc = self.get(f"bc_{dir}%beg")
+            end_bc = self.get(f"bc_{dir}%end")
+            if beg_bc is not None and end_bc is not None:
+                self.prohibit((beg_bc == -1 and end_bc != -1) or (end_bc == -1 and beg_bc != -1), f"bc_{dir}%beg and bc_{dir}%end must be both periodic (= -1) or both non-periodic")
+
+            # Range check (skip for cylindrical y/z)
+            skip_check = cyl_coord and dir in ["y", "z"]
+            for bound in ["beg", "end"]:
+                bc_key = f"bc_{dir}%{bound}"
+                bc_val = self.get(bc_key)
+
+                if not skip_check and bc_val is not None:
+                    self.prohibit(bc_val > -1 or bc_val < -17, f"{bc_key} must be between -1 and -17")
+                    self.prohibit(bc_val == -14 and not cyl_coord, f"{bc_key} must not be -14 (BC_AXIS) for non-cylindrical coordinates")
+
+        # Check BC_NULL is not used
+        for dir in ["x", "y", "z"]:
+            for bound in ["beg", "end"]:
+                bc_val = self.get(f"bc_{dir}%{bound}")
+                self.prohibit(bc_val == -13, "Boundary condition -13 (BC_NULL) is not supported")
+
+        # Cylindrical specific checks
+        if cyl_coord:
+            self.prohibit(n is not None and n == 0, "n must be positive (2D or 3D) for cylindrical coordinates")
+            bc_y_beg = self.get("bc_y%beg")
+            bc_y_end = self.get("bc_y%end")
+            bc_z_beg = self.get("bc_z%beg")
+            bc_z_end = self.get("bc_z%end")
+
+            self.prohibit(p is not None and p == 0 and bc_y_beg != -2, "bc_y%beg must be -2 (BC_REFLECTIVE) for 2D cylindrical coordinates (p = 0)")
+            self.prohibit(p is not None and p > 0 and bc_y_beg != -14, "bc_y%beg must be -14 (BC_AXIS) for 3D cylindrical coordinates (p > 0)")
+
+            if bc_y_end is not None:
+                self.prohibit(bc_y_end > -1 or bc_y_end < -17, "bc_y%end must be between -1 and -17")
+                self.prohibit(bc_y_end == -14, "bc_y%end must not be -14 (BC_AXIS)")
+
+            # 3D cylindrical
+            if p is not None and p > 0:
+                self.prohibit(bc_z_beg is not None and bc_z_beg not in [-1, -2], "bc_z%beg must be -1 (periodic) or -2 (reflective) for 3D cylindrical coordinates")
+                self.prohibit(bc_z_end is not None and bc_z_end not in [-1, -2], "bc_z%end must be -1 (periodic) or -2 (reflective) for 3D cylindrical coordinates")
+
+    def check_bubbles_euler(self):
+        """Checks constraints on bubble parameters"""
+        bubbles_euler = self.get("bubbles_euler", "F") == "T"
+
+        if not bubbles_euler:
+            return
+
+        nb = self.get("nb")
+        polydisperse = self.get("polydisperse", "F") == "T"
+        thermal = self.get("thermal")
+        model_eqns = self.get("model_eqns")
+        cyl_coord = self.get("cyl_coord", "F") == "T"
+        num_fluids = self.get("num_fluids", 1)
+
+        self.prohibit(nb is None or nb < 1, "The Ensemble-Averaged Bubble Model requires nb >= 1")
+        self.prohibit(polydisperse and nb == 1, "Polydisperse bubble dynamics requires nb > 1")
+        self.prohibit(polydisperse and nb is not None and nb % 2 == 0, "nb must be odd for polydisperse bubbles")
+        self.prohibit(thermal is not None and thermal > 3, "thermal must be <= 3")
+        self.prohibit(model_eqns == 3, "Bubble models untested with 6-equation model (model_eqns = 3)")
+        self.prohibit(model_eqns == 1, "Bubble models untested with pi-gamma model (model_eqns = 1)")
+        self.prohibit(cyl_coord, "Bubble models untested in cylindrical coordinates")
+        # The ensemble-averaged closure is written for one carrier liquid: the void fraction occupies
+        # the last advection slot and the liquid keeps its own coefficients, undiluted. Above two
+        # fluids the mixture rule has no derivation behind it (MFlowCode/MFC#1786).
+        self.prohibit(
+            num_fluids is not None and num_fluids > 2,
+            "The Ensemble-Averaged Bubble Model is derived for a single carrier liquid; num_fluids must be <= 2",
+        )
+
+        # The subgrid void fraction enters the closure as 1/(1 - alpha), an O(alpha) expansion that only
+        # holds in the dilute limit. Outside it the Euler-Euler model is not recommended, so warn rather
+        # than refuse (MFlowCode/MFC#1793).
+        void_idx = num_fluids if num_fluids else 1
+        num_patches = self.get("num_patches", 0) or 0
+        for i in range(1, num_patches + 1):
+            alpha = self.get(f"patch_icpp({i})%alpha({void_idx})")
+            self.warn(
+                alpha is not None and alpha > DILUTE_VOID_FRACTION_MAX,
+                f"patch_icpp({i})%alpha({void_idx}) = {alpha} is not a dilute void fraction; the "
+                f"Ensemble-Averaged Bubble Model is an O(alpha) expansion and is not recommended above "
+                f"{DILUTE_VOID_FRACTION_MAX}",
+            )
+
+        # BUBBLE PHYSICS PARAMETERS
+        # Validate bubble reference parameters (bub_pp%)
+        R0ref = self.get("bub_pp%R0ref")
+        p0ref = self.get("bub_pp%p0ref")
+        rho0ref = self.get("bub_pp%rho0ref")
+        T0ref = self.get("bub_pp%T0ref")
+
+        if R0ref is not None:
+            self.prohibit(R0ref <= 0, "bub_pp%R0ref (reference bubble radius) must be positive")
+        if p0ref is not None:
+            self.prohibit(p0ref <= 0, "bub_pp%p0ref (reference pressure) must be positive")
+        if rho0ref is not None:
+            self.prohibit(rho0ref <= 0, "bub_pp%rho0ref (reference density) must be positive")
+        if T0ref is not None:
+            self.prohibit(T0ref <= 0, "bub_pp%T0ref (reference temperature) must be positive")
+
+        # Viscosities must be non-negative
+        mu_l = self.get("bub_pp%mu_l")
+        mu_g = self.get("bub_pp%mu_g")
+        mu_v = self.get("bub_pp%mu_v")
+
+        if mu_l is not None:
+            self.prohibit(mu_l < 0, "bub_pp%mu_l (liquid viscosity) must be non-negative")
+        if mu_g is not None:
+            self.prohibit(mu_g < 0, "bub_pp%mu_g (gas viscosity) must be non-negative")
+        if mu_v is not None:
+            self.prohibit(mu_v < 0, "bub_pp%mu_v (vapor viscosity) must be non-negative")
+
+        # Surface tension must be non-negative
+        ss = self.get("bub_pp%ss")
+        if ss is not None:
+            self.prohibit(ss < 0, "bub_pp%ss (surface tension) must be non-negative")
+
+    def check_qbmm_and_polydisperse(self):
+        """Checks constraints on QBMM and polydisperse bubble parameters"""
+        polydisperse = self.get("polydisperse", "F") == "T"
+        bubbles_euler = self.get("bubbles_euler", "F") == "T"
+        poly_sigma = self.get("poly_sigma")
+        qbmm = self.get("qbmm", "F") == "T"
+        nnode = self.get("nnode")
+
+        self.prohibit(polydisperse and not bubbles_euler, "Polydisperse bubble modeling requires the bubbles_euler flag to be set")
+        self.prohibit(polydisperse and poly_sigma is None, "Polydisperse bubble modeling requires poly_sigma to be set")
+        self.prohibit(polydisperse and poly_sigma is not None and poly_sigma <= 0, "poly_sigma must be positive")
+        self.prohibit(qbmm and not bubbles_euler, "QBMM requires the bubbles_euler flag to be set")
+        self.prohibit(qbmm and nnode is not None and nnode != 4, "QBMM requires nnode = 4")
+
+    def check_adv_n(self):
+        """Checks constraints on adv_n flag"""
+        adv_n = self.get("adv_n", "F") == "T"
+        bubbles_euler = self.get("bubbles_euler", "F") == "T"
+        num_fluids = self.get("num_fluids")
+        qbmm = self.get("qbmm", "F") == "T"
+
+        if not adv_n:
+            return
+
+        self.prohibit(not bubbles_euler, "adv_n requires bubbles_euler to be enabled")
+        self.prohibit(num_fluids != 1, "adv_n requires num_fluids = 1")
+        self.prohibit(qbmm, "adv_n is not compatible with qbmm")
+
+    def check_hypoelasticity(self):
+        """Checks constraints on hypoelasticity parameters"""
+        hypoelasticity = self.get("hypoelasticity", "F") == "T"
+        model_eqns = self.get("model_eqns")
+        riemann_solver = self.get("riemann_solver")
+        riemann_hypo_ADC = self.get("riemann_hypo_ADC", "F") == "T"
+        hypo_hll_interface_rhs = self.get("hypo_hll_interface_rhs", "F") == "T"
+        self.prohibit(riemann_hypo_ADC and not hypoelasticity, "riemann_hypo_ADC requires hypoelasticity to be enabled")
+        self.prohibit(hypo_hll_interface_rhs and not hypoelasticity, "hypo_hll_interface_rhs requires hypoelasticity to be enabled")
+
+        if not hypoelasticity:
+            return
+
+        self.prohibit(model_eqns is not None and model_eqns != 2, "hypoelasticity requires model_eqns = 2")
+        self.prohibit(riemann_solver is not None and riemann_solver not in [1, 2, 4], "hypoelasticity requires HLL (1), HLLC (2), or HLLD (4) Riemann solver")
+        self.prohibit(riemann_hypo_ADC and riemann_solver is not None and riemann_solver not in [2, 4], "riemann_hypo_ADC only applies to HLLC (2) or HLLD (4)")
+        self.prohibit(hypo_hll_interface_rhs and riemann_solver is not None and riemann_solver != 1, "hypo_hll_interface_rhs requires HLL Riemann solver (riemann_solver = 1)")
+        viscous = self.get("viscous", "F") == "T"
+        surface_tension = self.get("surface_tension", "F") == "T"
+        self.prohibit(riemann_solver == 4 and viscous, "HLLD hypoelasticity does not support viscous effects (the dual-pass omits the viscous source term)")
+        self.prohibit(riemann_solver == 4 and surface_tension, "HLLD hypoelasticity does not support surface tension (the dual-pass omits the surface-tension source term)")
+        cont_damage = self.get("cont_damage", "F") == "T"
+        bubbles_euler = self.get("bubbles_euler", "F") == "T"
+        chemistry = self.get("chemistry", "F") == "T"
+        mhd = self.get("mhd", "F") == "T"
+        n = self.get("n", 0)
+        p = self.get("p", 0)
+        cyl_coord = self.get("cyl_coord", "F") == "T"
+        num_fluids = self.get("num_fluids")
+        alt_soundspeed = self.get("alt_soundspeed", "F") == "T"
+        self.prohibit(cyl_coord and p > 0, "3D cylindrical hypoelasticity is not supported")
+        self.prohibit(riemann_solver == 4 and n == 0, "HLLD hypoelasticity requires at least 2D (n > 0)")
+        self.prohibit(riemann_solver == 4 and num_fluids is not None and num_fluids != 2, "HLLD hypoelasticity requires exactly 2 fluid components")
+        self.prohibit(alt_soundspeed and num_fluids is not None and num_fluids != 2, "hypoelastic alt_soundspeed requires exactly 2 fluid components")
+        self.prohibit(mhd, "MHD and hypoelasticity cannot be enabled together")
+        self.prohibit(bubbles_euler, "Hypoelasticity does not support Euler-Euler bubbles")
+        self.prohibit(riemann_solver == 4 and cont_damage, "HLLD hypoelasticity does not support continuum damage (the dual-pass does not damage-scale the shear modulus)")
+        self.prohibit(riemann_solver == 4 and chemistry, "HLLD hypoelasticity does not support chemistry")
+        self.prohibit(
+            riemann_hypo_ADC and (bubbles_euler or surface_tension or chemistry or cont_damage),
+            "riemann_hypo_ADC does not support bubbles, surface tension, chemistry, or continuum damage (the ADC HLL blend omits their flux components)",
+        )
+        fd_order = self.get("fd_order")
+        wave_speeds = self.get("wave_speeds")
+        low_Mach = self.get("low_Mach", 0)
+        ADC_kappa = self.get("ADC_kappa")
+        cfl_const_dt = self.get("cfl_const_dt", "F") == "T"
+        cfl_adap_dt = self.get("cfl_adap_dt", "F") == "T"
+        self.prohibit(fd_order is None, "hypoelasticity requires fd_order to be set (1, 2, or 4); the finite-difference coefficients are initialized unconditionally")
+        self.prohibit(wave_speeds == 2, "Pressure-based wave speeds (wave_speeds = 2) omit the elastic longitudinal speed and are not supported with hypoelasticity")
+        self.prohibit(riemann_hypo_ADC and low_Mach > 0, "riemann_hypo_ADC does not support low_Mach (the ADC HLL reference flux uses pre-correction velocities)")
+        self.prohibit(riemann_hypo_ADC and ADC_kappa is not None and ADC_kappa <= 0, "ADC_kappa must be positive")
+        self.prohibit(
+            cfl_const_dt or cfl_adap_dt, "Automatic CFL time stepping uses the acoustic sound speed only and does not bound the elastic characteristic speed; set dt explicitly for hypoelastic runs"
+        )
+
+    def check_phase_change(self):
+        """Checks constraints on phase change parameters"""
+        relax = self.get("relax", "F") == "T"
+        relax_model = self.get("relax_model")
+        model_eqns = self.get("model_eqns")
+        num_fluids = self.get("num_fluids")
+        palpha_eps = self.get("palpha_eps")
+        ptgalpha_eps = self.get("ptgalpha_eps")
+
+        if not relax:
+            return
+
+        self.prohibit(
+            num_fluids is None or num_fluids < 2,
+            "phase change requires num_fluids >= 2 (liquid = 1, vapor = 2)",
+        )
+        self.prohibit(
+            (model_eqns not in (2, 3) or (model_eqns == 2 and relax_model not in (5, 6)) or (model_eqns == 3 and relax_model not in (1, 4, 5, 6))),
+            "phase change requires model_eqns==2 with relax_model in [5,6] or model_eqns==3 with relax_model in [1,4,5,6]",
+        )
+        self.prohibit(palpha_eps is not None and palpha_eps <= 0, "palpha_eps must be positive")
+        self.prohibit(palpha_eps is not None and palpha_eps >= 1, "palpha_eps must be less than 1")
+        self.prohibit(ptgalpha_eps is not None and ptgalpha_eps <= 0, "ptgalpha_eps must be positive")
+        self.prohibit(ptgalpha_eps is not None and ptgalpha_eps >= 1, "ptgalpha_eps must be less than 1")
+
+    def check_inflow_ramp(self):
+        """Checks constraints on the smooth start-up of a GRCBC inflow"""
+        for d in ("x", "y", "z"):
+            ramp = self.get(f"bc_{d}%vel_in_ramp", 0) or 0
+            frac0 = self.get(f"bc_{d}%vel_in_frac0", 0) or 0
+            self.prohibit(ramp < 0, f"bc_{d}%vel_in_ramp must be >= 0")
+            # a ramp needs an inflow to act on
+            self.prohibit(
+                ramp > 0 and self.get(f"bc_{d}%grcbc_in", "F") != "T",
+                f"bc_{d}%vel_in_ramp requires bc_{d}%grcbc_in",
+            )
+            self.prohibit(not 0 <= frac0 <= 1, f"bc_{d}%vel_in_frac0 must lie in [0, 1]")
+
+    def check_ibm(self):
+        """Checks constraints on Immersed Boundaries parameters"""
+        ib = self.get("ib", "F") == "T"
+        n = self.get("n", 0)
+        num_ibs = self.get("num_ibs", 0)
+        num_particle_clouds = self.get("num_particle_clouds", 0) or 0
+
+        ib_state_wrt = self.get("ib_state_wrt", "F") == "T"
+        many_ib_patch_parallelism = self.get("many_ib_patch_parallelism", "F") == "T"
+
+        fd_order = self.get("fd_order")
+        self.prohibit(ib and fd_order is None, "fd_order must be specified for ib")
+        self.prohibit(ib and n <= 0, "Immersed Boundaries do not work in 1D (requires n > 0)")
+        has_particle_clouds = num_particle_clouds > 0 and any((self.get(f"particle_cloud({i})%num_particles", 0) or 0) > 0 for i in range(1, num_particle_clouds + 1))
+        self.prohibit(
+            ib and num_ibs <= 0 and not has_particle_clouds,
+            "num_ibs must be >= 1 when ib is enabled (or specify at least one particle_cloud with num_particles > 0)",
+        )
+        num_ib_patches_max = get_fortran_constants().get("num_ib_patches_max_namelist", 50000)
+        self.prohibit(
+            ib and num_ibs > num_ib_patches_max,
+            f"num_ibs must be <= {num_ib_patches_max} (num_ib_patches_max_namelist in m_constants.fpp)",
+        )
+        self.prohibit(not ib and num_ibs > 0, "num_ibs is set, but ib is not enabled")
+        self.prohibit(ib_state_wrt and not ib, "ib_state_wrt requires ib to be enabled")
+        ib_force_wrt = self.get("ib_force_wrt", False)
+        self.prohibit(ib_force_wrt and not ib, "ib_force_wrt requires ib to be enabled")
+        ib_force_stride = self.get("ib_force_stride", 1)
+        self.prohibit(ib_force_stride < 1, "ib_force_stride must be >= 1")
+
+        p = self.get("p", 0)
+        for i in range(1, (num_ibs or 0) + 1):
+            kin_model = self.get(f"patch_ib({i})%kin_model", 0) or 0
+            self.prohibit(kin_model not in (0, 1, 2), f"patch_ib({i})%kin_model must be 0, 1 or 2")
+            self.prohibit(kin_model > 0 and self.get(f"patch_ib({i})%moving_ibm", 0) != 1, f"patch_ib({i})%kin_model requires moving_ibm = 1")
+            self.prohibit(kin_model > 0 and p <= 0, f"patch_ib({i})%kin_model requires a 3D case (p > 0)")
+            # Geometries 4, 5, 11 and 12 have their centroid replaced by the marked-cell centre of mass, with the
+            # difference kept in centroid_offset and re-applied when the patch is drawn. Prescribed kinematics write
+            # the centroid outright every stage, so the body would render centroid_offset away from the hinge.
+            self.prohibit(
+                kin_model > 0 and self.get(f"patch_ib({i})%geometry", 0) in (4, 5, 11, 12),
+                f"patch_ib({i})%kin_model is not supported for geometries 4, 5, 11 and 12, whose centroid is offset to the centre of mass",
+            )
+            self.prohibit(kin_model == 1 and (self.get(f"patch_ib({i})%kin_freq", 0) or 0) <= 0, f"patch_ib({i})%kin_freq must be > 0 when kin_model = 1")
+            self.prohibit(kin_model == 2 and (self.get(f"patch_ib({i})%kin_pitch_rate", 0) or 0) <= 0, f"patch_ib({i})%kin_pitch_rate must be > 0 when kin_model = 2")
+            self.prohibit(kin_model == 2 and (self.get(f"patch_ib({i})%kin_smooth", 0) or 0) <= 0, f"patch_ib({i})%kin_smooth must be > 0 when kin_model = 2")
+            self.prohibit(kin_model == 2 and (self.get(f"patch_ib({i})%kin_theta0", 0) or 0) <= 0, f"patch_ib({i})%kin_theta0 must be > 0 when kin_model = 2")
+        self.prohibit(many_ib_patch_parallelism and not ib, "many_ib_patch_parallelism requires ib to be enabled")
+
+        for i in range(1, num_particle_clouds + 1):
+            n = self.get("n", 0)
+            p = self.get("p", 0)
+            geometry = self.get(f"particle_cloud({i})%cloud_geometry", 1)
+            packing_method = self.get(f"particle_cloud({i})%packing_method", None)
+            self.prohibit(
+                geometry not in [1, 2],
+                f"particle_cloud({i})%cloud_geometry must be 1 (box) or 2 (hemisphere shell)",
+            )
+            self.prohibit(
+                packing_method is None,
+                f"particle_cloud({i})%packing_method must be specified (1 = rejection sampling, 2 = lattice)",
+            )
+            self.prohibit(
+                packing_method is not None and packing_method not in [1, 2],
+                f"particle_cloud({i})%packing_method must be 1 (rejection sampling) or 2 (lattice)",
+            )
+            shell_outer_radius = self.get(f"particle_cloud({i})%shell_outer_radius", None)
+            shell_inner_radius = self.get(f"particle_cloud({i})%shell_inner_radius", None)
+            radius = self.get(f"particle_cloud({i})%radius", None)
+            mass = self.get(f"particle_cloud({i})%mass", None)
+            num_particles = self.get(f"particle_cloud({i})%num_particles", None)
+            periodic = self.get(f"particle_cloud({i})%periodic", 0)
+            length_x = self.get(f"particle_cloud({i})%length_x", None)
+            length_y = self.get(f"particle_cloud({i})%length_y", None)
+            length_z = self.get(f"particle_cloud({i})%length_z", None)
+
+            self.prohibit(
+                periodic not in [0, 1],
+                f"particle_cloud({i})%periodic must be 0 (off) or 1 (on)",
+            )
+            self.prohibit(
+                periodic == 1 and geometry != 1,
+                f"particle_cloud({i})%periodic is only supported for box particle clouds",
+            )
+            self.prohibit(
+                periodic == 1 and packing_method != 1,
+                f"particle_cloud({i})%periodic is only supported for rejection packing",
+            )
+            self.prohibit(
+                periodic == 1
+                and (
+                    length_x is None
+                    or not self._is_numeric(length_x)
+                    or length_x <= 0
+                    or length_y is None
+                    or not self._is_numeric(length_y)
+                    or length_y <= 0
+                    or (p > 0 and (length_z is None or not self._is_numeric(length_z) or length_z <= 0))
+                ),
+                f"particle_cloud({i})%periodic requires positive box lengths in each active dimension",
+            )
+
+            # radius, mass, and num_particles are required and positive for every cloud, independent of
+            # geometry. An unset radius reaches the sampler as dflt_real, which makes min_dist negative and
+            # corrupts both the spatial-hash bin index and the overlap test; an unset mass/num_particles is
+            # meaningless. The Fortran sampler cannot re-check these cheaply, so they belong here.
+            self.prohibit(
+                num_particles is None or (self._is_numeric(num_particles) and num_particles <= 0),
+                f"particle_cloud({i})%num_particles must be specified and > 0",
+            )
+            self.prohibit(
+                radius is None or (self._is_numeric(radius) and radius <= 0),
+                f"particle_cloud({i})%radius must be specified and > 0",
+            )
+            self.prohibit(
+                mass is None or (self._is_numeric(mass) and mass <= 0),
+                f"particle_cloud({i})%mass must be specified and > 0",
+            )
+            # A hemisphere shell in 1D degenerates to a half-annulus the y-extent check below cannot see
+            # (it is skipped when n == 0), so reject it explicitly here.
+            self.prohibit(
+                geometry == 2 and n == 0,
+                f"particle_cloud({i}) hemisphere shell requires a 2D or 3D domain (n > 0)",
+            )
+            self.prohibit(
+                geometry == 2 and (shell_inner_radius is None or (self._is_numeric(shell_inner_radius) and shell_inner_radius < 0)),
+                f"particle_cloud({i}) hemisphere shell requires shell_inner_radius >= 0",
+            )
+            self.prohibit(
+                geometry == 2
+                and (
+                    shell_outer_radius is None
+                    or radius is None
+                    or shell_inner_radius is None
+                    or (all(self._is_numeric(v) for v in [shell_outer_radius, shell_inner_radius, radius]) and shell_outer_radius <= shell_inner_radius + 2 * radius)
+                ),
+                f"particle_cloud({i}) hemisphere shell requires shell_outer_radius > shell_inner_radius + 2*radius",
+            )
+            self.prohibit(
+                geometry == 2 and packing_method == 2,
+                f"particle_cloud({i}) hemisphere-shell lattice packing is not implemented",
+            )
+            if geometry == 2 and shell_outer_radius is not None and self._is_numeric(shell_outer_radius):
+                x_centroid = self.get(f"particle_cloud({i})%x_centroid", None)
+                y_centroid = self.get(f"particle_cloud({i})%y_centroid", None)
+                z_centroid = self.get(f"particle_cloud({i})%z_centroid", None)
+                x_beg = self.get("x_domain%beg", None)
+                x_end = self.get("x_domain%end", None)
+                y_beg = self.get("y_domain%beg", None)
+                y_end = self.get("y_domain%end", None)
+                z_beg = self.get("z_domain%beg", None)
+                z_end = self.get("z_domain%end", None)
+
+                if all(self._is_numeric(v) for v in [x_centroid, x_beg, x_end]):
+                    self.prohibit(
+                        x_centroid - shell_outer_radius < x_beg or x_centroid + shell_outer_radius > x_end,
+                        f"particle_cloud({i}) hemisphere shell x-extent must lie within x_domain",
+                    )
+                if n > 0 and all(self._is_numeric(v) for v in [y_centroid, y_beg, y_end, radius]):
+                    if p > 0:
+                        self.prohibit(
+                            y_centroid - shell_outer_radius < y_beg or y_centroid + shell_outer_radius > y_end,
+                            f"particle_cloud({i}) hemisphere shell y-extent must lie within y_domain",
+                        )
+                    else:
+                        # 2D half-annulus opens toward +y from the flat face at y_centroid; require one
+                        # particle radius of standoff so no particle surface sits on the domain wall.
+                        self.prohibit(
+                            y_centroid - radius < y_beg or y_centroid + shell_outer_radius > y_end,
+                            f"particle_cloud({i}) half-annulus must clear y_domain by one particle radius",
+                        )
+                if p > 0 and all(self._is_numeric(v) for v in [z_centroid, z_beg, z_end, radius]):
+                    # 3D hemisphere shell opens toward +z from the flat face at z_centroid; require one
+                    # particle radius of standoff so no particle surface sits on the domain wall.
+                    self.prohibit(
+                        z_centroid - radius < z_beg or z_centroid + shell_outer_radius > z_end,
+                        f"particle_cloud({i}) hemisphere shell must clear z_domain by one particle radius",
+                    )
+
+        num_ib_airfoils_max = get_fortran_constants().get("num_ib_airfoils_max", 5)
+        num_stl_models_max = get_fortran_constants().get("num_stl_models_max", 10)
+        num_stl_models = self.get("num_stl_models", 0)
+        self.prohibit(
+            num_stl_models < 0,
+            "num_stl_models must be >= 0",
+        )
+        self.prohibit(
+            num_stl_models > num_stl_models_max,
+            f"num_stl_models must be <= {num_stl_models_max} (num_stl_models_max in m_constants.fpp)",
+        )
+        for i in range(1, num_ibs + 1):
+            geometry = self.get(f"patch_ib({i})%geometry", None)
+            airfoil_id = self.get(f"patch_ib({i})%airfoil_id", None)
+            model_id = self.get(f"patch_ib({i})%model_id", None)
+            if geometry in (4, 11):
+                self.prohibit(
+                    airfoil_id is None or airfoil_id <= 0,
+                    f"patch_ib({i})%airfoil_id must be set to a positive integer for airfoil geometry ({geometry})",
+                )
+                if airfoil_id is not None:
+                    self.prohibit(
+                        airfoil_id > num_ib_airfoils_max,
+                        f"patch_ib({i})%airfoil_id={airfoil_id} exceeds num_ib_airfoils_max={num_ib_airfoils_max}",
+                    )
+            elif airfoil_id is not None and airfoil_id > 0:
+                self.prohibit(
+                    True,
+                    f"patch_ib({i})%airfoil_id is set but geometry ({geometry}) is not an airfoil (4 or 11)",
+                )
+            if geometry in (5, 12):
+                self.prohibit(
+                    model_id is None or model_id <= 0,
+                    f"patch_ib({i})%model_id must be set to a positive integer for STL geometry ({geometry})",
+                )
+                if model_id is not None:
+                    self.prohibit(
+                        model_id > num_stl_models,
+                        f"patch_ib({i})%model_id={model_id} exceeds num_stl_models={num_stl_models}",
+                    )
+            elif model_id is not None and model_id > 0:
+                self.prohibit(
+                    True,
+                    f"patch_ib({i})%model_id is set but geometry ({geometry}) is not an STL model (5 or 12)",
+                )
+            # Vieille's-law burn-rate exponent must be non-negative: a negative exponent makes
+            # v_blow ~ p^n diverge (Inf) as the surface pressure approaches zero.
+            burn_rate_exp = self.get(f"patch_ib({i})%burn_rate_exp", None)
+            self.prohibit(
+                burn_rate_exp is not None and burn_rate_exp < 0,
+                f"patch_ib({i})%burn_rate_exp must be >= 0 (Vieille's-law pressure exponent)",
+            )
+        num_patches = self.get("num_patches", 0) or 0
+        for i in range(1, num_patches + 1):
+            geometry = self.get(f"patch_icpp({i})%geometry", None)
+            model_id = self.get(f"patch_icpp({i})%model_id", None)
+            if geometry == 21:
+                self.prohibit(
+                    model_id is None or model_id <= 0,
+                    f"patch_icpp({i})%model_id must be set to a positive integer for STL geometry (21)",
+                )
+                if model_id is not None:
+                    self.prohibit(
+                        model_id > num_stl_models,
+                        f"patch_icpp({i})%model_id={model_id} exceeds num_stl_models={num_stl_models}",
+                    )
+            elif model_id is not None and model_id > 0:
+                self.prohibit(True, f"patch_icpp({i})%model_id is set but geometry ({geometry}) is not an STL model (21)")
+
+    def _check_initial_states_inside_eos(self, num_fluids, eos_names):
+        """Every patch must start each state-dependent fluid where rho e > 0 and c^2 > 0; the solver has no clamp."""
+        num_patches = self.get("num_patches", 0) or 0
+        for i in range(1, num_fluids + 1):
+            eos_ = self.get(f"fluid_pp({i})%eos")
+            g = lambda k: self.get(f"fluid_pp({i})%{k}")  # noqa: E731
+            if eos_ == eos_names["mie_gruneisen"]:
+                coefficients = lambda r: eos.eos_coefficients(r, g("mg_rho0"), g("mg_c0"), g("mg_s"), g("mg_gruneisen"), g("mg_gruneisen_a") or 0.0, g("mg_s2") or 0.0, g("mg_s3") or 0.0)  # noqa: E731
+            elif eos_ == eos_names["jwl"]:
+                coefficients = lambda r: eos.jwl_coefficients(r, g("jwl_rho0"), g("jwl_a"), g("jwl_b"), g("jwl_r1"), g("jwl_r2"), g("jwl_omega"))  # noqa: E731
+            elif eos_ == eos_names.get("vinet"):
+                coefficients = lambda r: eos.coefficients_from_curve(r, eos.vinet_reference(r, g("vinet_rho0"), g("vinet_k0"), g("vinet_k0p")), g("vinet_gruneisen"))  # noqa: E731
+            else:
+                continue
+            for j in range(1, num_patches + 1):
+                ar, a, p = (self.get(f"patch_icpp({j})%alpha_rho({i})"), self.get(f"patch_icpp({j})%alpha({i})"), self.get(f"patch_icpp({j})%pres"))
+                if not all(isinstance(x, (int, float)) for x in (ar, a, p)) or a <= 0:
+                    continue
+                try:
+                    gamma, pi, dpi, dgamma = coefficients(ar / a)
+                except TypeError:
+                    continue  # incomplete parameters are reported by the rules above
+                except (ValueError, OverflowError, ZeroDivisionError) as err:
+                    self.prohibit(True, f"patch_icpp({j}) starts fluid {i} outside its equation of state: rho = {ar/a:.4g} ({err})")
+                    continue
+                rho_e = gamma * p + pi
+                c2 = ((gamma + 1.0) * p + pi) / (ar / a) - dpi - p * dgamma
+                self.prohibit(
+                    rho_e <= 0 or c2 <= 0,
+                    f"patch_icpp({j}) starts fluid {i} outside its equation of state: rho = {ar/a:.4g}, p = {p:.4g} gives " f"rho e = {rho_e:.3g} and Gamma c^2 = {c2:.3g}; both must be positive",
+                )
+
+    def check_eos_selector(self):
+        """Restricts fluid_pp(i)%eos to implemented backends and enforces their parameter requirements"""
+        num_fluids = self.get("num_fluids")
+        if num_fluids is None:
+            return
+        eos_names = CONSTRAINTS["fluid_pp(1)%eos"]["names"]
+        eos_ideal_gas = eos_names["ideal_gas"]
+        # The state-dependent families: selector value -> (parameter prefix, its parameters)
+        families = {
+            eos_names["mie_gruneisen"]: ("mg", ("rho0", "c0", "s", "gruneisen")),
+            eos_names["jwl"]: ("jwl", ("a", "b", "r1", "r2", "omega", "rho0")),
+            eos_names["vinet"]: ("vinet", ("k0", "k0p", "rho0", "gruneisen")),
+        }
+        optional = {"mg": ("gruneisen_a", "t0", "s2", "s3"), "jwl": ("t0",), "vinet": ("gruneisen_a", "t0")}
+        bub_fac = 1 if self.get("bubbles_euler", "F") == "T" else 0
+        state_dependent = {}
+        for i in range(1, num_fluids + 1 + bub_fac):
+            eos = self.get(f"fluid_pp({i})%eos")
+            effective = eos if eos is not None else eos_names["stiffened_gas"]
+            for value, (prefix, keys) in families.items():
+                self.prohibit(
+                    effective != value and any(self.get(f"fluid_pp({i})%{prefix}_{k}") is not None for k in keys + optional.get(prefix, ())),
+                    f"fluid_pp({i})%{prefix}_* are only read when fluid_pp({i})%eos = '{ {v: n for n, v in eos_names.items()}[value] }'",
+                )
+            if eos is None:
+                continue
+            self.prohibit(eos not in eos_names.values(), f"fluid_pp({i})%eos must be one of {', '.join(repr(n) for n in eos_names)}")
+            self.prohibit(
+                eos == eos_ideal_gas and self.get(f"fluid_pp({i})%pi_inf") is not None,
+                f"fluid_pp({i})%eos = 'ideal_gas' has no stiffness; do not set fluid_pp({i})%pi_inf",
+            )
+            if eos not in families:
+                continue
+            prefix, keys = families[eos]
+            state_dependent[i] = prefix
+            name = {v: n for n, v in eos_names.items()}[eos]
+            par = {k: self.get(f"fluid_pp({i})%{prefix}_{k}") for k in keys}
+            self.prohibit(
+                any(p is None for p in par.values()),
+                f"fluid_pp({i})%eos = '{name}' requires fluid_pp({i})%{prefix}_{{{', '.join(keys)}}}",
+            )
+            for k in ("gamma", "pi_inf"):
+                self.prohibit(
+                    self.get(f"fluid_pp({i})%{k}") is not None,
+                    f"fluid_pp({i})%{k} is not read with eos = '{name}'; the reference curve replaces it",
+                )
+            if any(p is None for p in par.values()):
+                continue
+            if prefix == "mg":
+                self.prohibit(par["rho0"] <= 0 or par["c0"] <= 0 or par["gruneisen"] <= 0, f"fluid_pp({i})%mg_rho0, mg_c0 and mg_gruneisen must be positive")
+                self.prohibit(par["s"] < 1, f"fluid_pp({i})%mg_s must be >= 1 (u_s = c0 + s u_p; s < 1 gives no shock)")
+            elif prefix == "jwl":
+                self.prohibit(par["a"] <= 0 or par["omega"] <= 0 or par["rho0"] <= 0, f"fluid_pp({i})%jwl_a, jwl_omega and jwl_rho0 must be positive")
+                self.prohibit(not par["r1"] > par["r2"] > 0, f"fluid_pp({i})%jwl_r1 > jwl_r2 > 0 is required")
+            else:
+                self.prohibit(par["k0"] <= 0 or par["rho0"] <= 0 or par["gruneisen"] <= 0, f"fluid_pp({i})%vinet_k0, vinet_rho0 and vinet_gruneisen must be positive")
+                self.prohibit(par["k0p"] <= 1, f"fluid_pp({i})%vinet_k0p must exceed 1")
+        if self.get("T_wrt", "F") == "T":
+            for i in range(1, (self.get("num_fluids") or 0) + 1):
+                cv = self.get(f"fluid_pp({i})%cv")
+                self.prohibit(cv is None or cv <= 0, f"T_wrt = T needs fluid_pp({i})%cv > 0")
+        if not state_dependent:
+            return
+        # A temperature integrates from the reference state, so it needs T at rho0 as well as cv.
+        rta = self.get("rburn%ta")
+        for i, prefix in state_dependent.items():
+            if self.get("T_wrt", "F") == "T" or (i == 1 and self._is_numeric(rta) and rta > 0):
+                t0 = self.get(f"fluid_pp({i})%{prefix}_t0")
+                self.prohibit(t0 is None or t0 <= 0, f"the temperature of fluid {i} needs fluid_pp({i})%{prefix}_t0 > 0")
+        self._check_initial_states_inside_eos(num_fluids, eos_names)
+        # The per-phase evaluation is wired through the 5-equation paths only; every feature below still
+        # reads the stiffened-gas coefficients directly.
+        self.prohibit(self.get("model_eqns") not in (2, 3), "a state-dependent eos (mie_gruneisen, jwl, vinet) requires model_eqns = 2 or 3")
+        self.prohibit(self.get("riemann_solver") not in (1, 2, 5), "a state-dependent eos (mie_gruneisen, jwl, vinet) requires riemann_solver = 1, 2 or 5")
+        self.prohibit(self.get("wave_speeds") == 2, "a state-dependent eos (mie_gruneisen, jwl, vinet) requires wave_speeds = 1 (the PVRS estimate is stiffened-gas only)")
+        for j in range(1, (self.get("num_patches") or 0) + 1):
+            self.prohibit(self.get(f"patch_icpp({j})%hcid") in (202, 203), f"patch_icpp({j})%hcid = 202/203 read fluid_pp(1)%gamma, which a state-dependent eos does not set")
+        for flag in ("bubbles_euler", "bubbles_lagrange", "igr", "relativity", "mhd", "chemistry", "relax"):
+            self.prohibit(self.get(flag, "F") == "T", f"a state-dependent eos (mie_gruneisen, jwl, vinet) is not supported with {flag} = T")
+
+    def check_stiffened_eos(self):
+        """Checks constraints on stiffened equation of state fluids parameters"""
+        num_fluids = self.get("num_fluids")
+        model_eqns = self.get("model_eqns")
+        bubbles_euler = self.get("bubbles_euler", "F") == "T"
+
+        if num_fluids is None:
+            return
+
+        # Allow one extra fluid property slot when using bubbles_euler
+        bub_fac = 1 if (bubbles_euler) else 0
+
+        for i in range(1, num_fluids + 1 + bub_fac):
+            gamma = self.get(f"fluid_pp({i})%gamma")
+            pi_inf = self.get(f"fluid_pp({i})%pi_inf")
+            cv = self.get(f"fluid_pp({i})%cv")
+
+            # Positivity checks
+            if gamma is not None:
+                self.prohibit(gamma <= 0, f"fluid_pp({i})%gamma must be positive")
+            if pi_inf is not None:
+                self.prohibit(pi_inf < 0, f"fluid_pp({i})%pi_inf must be non-negative")
+            if cv is not None:
+                self.prohibit(cv < 0, f"fluid_pp({i})%cv must be positive")
+
+            # Model-specific support
+            if model_eqns == 1:
+                self.prohibit(gamma is not None, f"model_eqns = 1 does not support fluid_pp({i})%gamma")
+                self.prohibit(pi_inf is not None, f"model_eqns = 1 does not support fluid_pp({i})%pi_inf")
+
+    def check_surface_tension(self):
+        """Checks constraints on surface tension"""
+        surface_tension = self.get("surface_tension", "F") == "T"
+        sigma = self.get("sigma")
+        model_eqns = self.get("model_eqns")
+        num_fluids = self.get("num_fluids")
+
+        if not surface_tension and sigma is None:
+            return
+
+        self.prohibit(surface_tension and sigma is None, "sigma must be set if surface_tension is enabled")
+        self.prohibit(surface_tension and sigma is not None and sigma < 0, "sigma must be greater than or equal to zero")
+        self.prohibit(sigma is not None and not surface_tension, "sigma is set but surface_tension is not enabled")
+        self.prohibit(surface_tension and model_eqns not in [2, 3], "The surface tension model requires model_eqns = 2 or model_eqns = 3")
+        self.prohibit(surface_tension and num_fluids != 2, "The surface tension model requires num_fluids = 2")
+
+    def check_mhd(self):
+        """Checks constraints on MHD parameters"""
+        mhd = self.get("mhd", "F") == "T"
+        num_fluids = self.get("num_fluids")
+        model_eqns = self.get("model_eqns")
+        relativity = self.get("relativity", "F") == "T"
+        Bx0 = self.get("Bx0")
+        n = self.get("n", 0)
+
+        self.prohibit(mhd and num_fluids != 1, "MHD is only available for single-component flows (num_fluids = 1)")
+        self.prohibit(mhd and model_eqns != 2, "MHD is only available for the 5-equation model (model_eqns = 2)")
+        self.prohibit(relativity and not mhd, "relativity requires mhd to be enabled")
+        pi_inf = self.get("fluid_pp(1)%pi_inf")
+        self.prohibit(
+            relativity and pi_inf is not None and pi_inf != 0,
+            "relativity assumes an ideal gas; fluid_pp(1)%pi_inf must be 0",
+        )
+        self.prohibit(Bx0 is not None and not mhd, "Bx0 must not be set if MHD is not enabled")
+        self.prohibit(mhd and n is not None and n == 0 and Bx0 is None, "Bx0 must be set in 1D MHD simulations")
+        self.prohibit(mhd and n is not None and n > 0 and Bx0 is not None, "Bx0 must not be set in 2D/3D MHD simulations")
+
+    # Simulation-Specific Checks
+
+    def check_riemann_solver(self):
+        """Checks constraints on Riemann solver (simulation only)"""
+        riemann_solver = self.get("riemann_solver")
+        model_eqns = self.get("model_eqns")
+        wave_speeds = self.get("wave_speeds")
+        avg_state = self.get("avg_state")
+        low_Mach = self.get("low_Mach", 0)
+        cyl_coord = self.get("cyl_coord", "F") == "T"
+        viscous = self.get("viscous", "F") == "T"
+        hll_u_interface = self.get("hll_u_interface", "F") == "T"
+
+        self.prohibit(riemann_solver is None, "riemann_solver must be specified (1=HLL, 2=HLLC, 4=HLLD, 5=Lax-Friedrichs)")
+        if riemann_solver is None:
+            return
+
+        self.prohibit(riemann_solver not in [1, 2, 4, 5], "riemann_solver must be 1 (HLL), 2 (HLLC), 4 (HLLD), or 5 (Lax-Friedrichs)")
+        self.prohibit(hll_u_interface and riemann_solver != 1, "hll_u_interface requires HLL Riemann solver (riemann_solver = 1)")
+        mhd = self.get("mhd", "F") == "T"
+        surface_tension = self.get("surface_tension", "F") == "T"
+        self.prohibit(hll_u_interface and mhd, "HLL Method 2 does not support MHD (the MHD path zeroes the shared interface-velocity trace)")
+        self.prohibit(riemann_solver == 1 and hll_u_interface and cyl_coord and self.get("p", 0) > 0, "HLL Method 2 is not supported for 3D cylindrical geometry")
+        self.prohibit(surface_tension and riemann_solver == 1 and not hll_u_interface, "surface_tension requires a shared interface-velocity representation (HLL Method 2 or HLLC)")
+        self.prohibit(surface_tension and riemann_solver == 5, "surface_tension requires a shared interface-velocity representation (HLL Method 2 or HLLC)")
+        self.prohibit(riemann_solver != 2 and model_eqns == 3, "6-equation model (model_eqns = 3) requires riemann_solver = 2 (HLLC)")
+        self.prohibit(wave_speeds is not None and wave_speeds not in [1, 2], "wave_speeds must be 1 or 2")
+        self.prohibit(avg_state is not None and avg_state not in [1, 2], "avg_state must be 1 or 2")
+        self.prohibit(riemann_solver != 5 and wave_speeds is None, "wave_speeds must be set for riemann_solver 1, 2, or 4")
+        self.prohibit(riemann_solver != 5 and avg_state is None, "avg_state must be set for riemann_solver 1, 2, or 4")
+        self.prohibit(low_Mach not in [0, 1, 2], "low_Mach must be 0, 1, or 2")
+        self.prohibit(riemann_solver != 2 and low_Mach == 2, "low_Mach = 2 requires riemann_solver = 2")
+        self.prohibit(low_Mach != 0 and model_eqns not in [2, 3], "low_Mach = 1 or 2 requires model_eqns = 2 or 3")
+        self.prohibit(riemann_solver == 4 and wave_speeds == 2, "HLLD uses its own direct wave-speed estimates; wave_speeds = 2 is not supported")
+        self.prohibit(riemann_solver == 4 and low_Mach > 0, "low_Mach corrections are not implemented for HLLD")
+        self.prohibit(riemann_solver == 5 and cyl_coord and viscous, "Lax Friedrichs with cylindrical viscous flux not supported")
+
+    def check_time_stepping(self):
+        """Checks time stepping parameters (simulation/post-process)"""
+        cfl_dt = self.get("cfl_dt", "F") == "T"
+        cfl_adap_dt = self.get("cfl_adap_dt", "F") == "T"
+        time_stepper = self.get("time_stepper")
+
+        # Check time_stepper bounds
+        self.prohibit(time_stepper is not None and (time_stepper < 1 or time_stepper > 3), "time_stepper must be 1, 2, or 3")
+
+        # CFL-based variable dt modes (use t_stop/t_save for termination)
+        # Note: adap_dt is NOT included here - it uses t_step_* for termination
+        variable_dt = cfl_dt or cfl_adap_dt
+
+        # dt validation (applies to all modes if dt is set)
+        dt = self.get("dt")
+        self.prohibit(dt is not None and dt <= 0, "dt must be positive")
+
+        if variable_dt:
+            cfl_target = self.get("cfl_target")
+            t_stop = self.get("t_stop")
+            t_save = self.get("t_save")
+            n_start = self.get("n_start")
+
+            self.prohibit(cfl_target is not None and (cfl_target <= 0 or cfl_target > 1), "cfl_target must be in (0, 1]")
+            self.prohibit(t_stop is not None and t_stop <= 0, "t_stop must be positive")
+            self.prohibit(t_save is not None and t_save <= 0, "t_save must be positive")
+            self.prohibit(t_save is not None and t_stop is not None and t_save > t_stop, "t_save must be <= t_stop")
+            self.prohibit(n_start is not None and n_start < 0, "n_start must be non-negative")
+        # t_step_* validation (applies to fixed and adap_dt modes)
+        t_step_start = self.get("t_step_start")
+        t_step_stop = self.get("t_step_stop")
+        t_step_save = self.get("t_step_save")
+
+        self.prohibit(t_step_start is not None and t_step_start < 0, "t_step_start must be non-negative")
+        self.prohibit(t_step_stop is not None and t_step_stop < 0, "t_step_stop must be non-negative")
+        self.prohibit(t_step_stop is not None and t_step_start is not None and t_step_stop <= t_step_start, "t_step_stop must be > t_step_start")
+        self.prohibit(t_step_save is not None and t_step_save <= 0, "t_step_save must be positive")
+        self.prohibit(
+            t_step_save is not None and t_step_stop is not None and t_step_start is not None and t_step_save > t_step_stop - t_step_start, "t_step_save must be <= (t_step_stop - t_step_start)"
+        )
+
+        if not variable_dt:
+            # dt is required whenever stepping is not CFL-driven. adap_dt is not an
+            # exemption: it uses dt as its initial value, and the Fortran checked
+            # `if (.not. cfl_dt) dt <= 0`, which fired on the dflt_real sentinel when
+            # dt was left unset. Cases that genuinely need no dt set cfl_adap_dt
+            # instead, which lands in the variable_dt branch above.
+            uses_fixed_stepping = self.is_set("t_step_start") or self.is_set("t_step_stop")
+            self.prohibit(uses_fixed_stepping and not self.is_set("dt"), "dt must be set when using fixed time stepping (t_step_start/t_step_stop)")
+
+    def check_finite_difference(self):
+        """Checks constraints on finite difference parameters"""
+        fd_order = self.get("fd_order")
+
+        if fd_order is None:
+            return
+
+        self.prohibit(fd_order not in [1, 2, 4], "fd_order must be 1, 2, or 4")
+
+    def check_weno_simulation(self):
+        """Checks WENO-specific constraints for simulation"""
+        if self._get_recon_type() != 1:
+            return
+
+        weno_order = self.get("weno_order")
+        weno_eps = self.get("weno_eps")
+        wenoz = self.get("wenoz", "F") == "T"
+        wenoz_q = self.get("wenoz_q")
+        teno = self.get("teno", "F") == "T"
+        teno_CT = self.get("teno_CT")
+        mapped_weno = self.get("mapped_weno", "F") == "T"
+        mp_weno = self.get("mp_weno", "F") == "T"
+        weno_avg = self.get("weno_avg", "F") == "T"
+        model_eqns = self.get("model_eqns")
+
+        # Check for multiple WENO schemes (regardless of weno_order being set)
+        num_schemes = sum([mapped_weno, wenoz, teno])
+        self.prohibit(num_schemes >= 2, "Only one of mapped_weno, wenoz, or teno can be set to true")
+
+        # Early return if weno_order not set (other checks need it)
+        if weno_order is None:
+            return
+
+        self.prohibit(weno_order != 1 and weno_eps is None, "weno_order != 1 requires weno_eps to be set. A typical value is 1e-6")
+        self.prohibit(weno_eps is not None and weno_eps <= 0, "weno_eps must be positive. A typical value is 1e-6")
+        self.prohibit(wenoz and weno_order == 7 and wenoz_q is None, "wenoz at 7th order requires wenoz_q to be set (should be 2, 3, or 4)")
+        self.prohibit(wenoz and weno_order == 7 and wenoz_q is not None and wenoz_q not in [2, 3, 4], "wenoz_q must be either 2, 3, or 4)")
+        self.prohibit(teno and teno_CT is None, "teno requires teno_CT to be set. A typical value is 1e-6")
+        self.prohibit(teno and teno_CT is not None and teno_CT <= 0, "teno_CT must be positive. A typical value is 1e-6")
+
+        self.prohibit(weno_order == 1 and mapped_weno, "mapped_weno is not compatible with weno_order = 1")
+        self.prohibit(weno_order == 1 and wenoz, "wenoz is not compatible with weno_order = 1")
+        self.prohibit(weno_order in [1, 3] and teno, "teno requires weno_order = 5 or 7")
+        self.prohibit(weno_order != 5 and mp_weno, "mp_weno requires weno_order = 5")
+        self.prohibit(model_eqns == 1 and weno_avg, "weno_avg is not compatible with model_eqns = 1")
+
+    def check_muscl_simulation(self):
+        """Checks MUSCL-specific constraints for simulation"""
+        if self._get_recon_type() != 2:
+            return
+
+        muscl_order = self.get("muscl_order")
+        muscl_lim = self.get("muscl_lim")
+        muscl_eps = self.get("muscl_eps")
+
+        if muscl_order is None:
+            return
+
+        self.prohibit(muscl_order == 2 and muscl_lim is None, "muscl_lim must be defined if using muscl_order = 2")
+        self.prohibit(muscl_lim is not None and (muscl_lim < 0 or muscl_lim > 5), "muscl_lim must be 0 (unlimited), 1, 2, 3, 4, or 5")
+        if muscl_eps is not None:
+            self.prohibit(muscl_eps < 0, "muscl_eps must be >= 0 (use 0 for textbook limiter behavior)")
+
+    def check_model_eqns_simulation(self):
+        """Checks model equation constraints specific to simulation"""
+        model_eqns = self.get("model_eqns")
+        avg_state = self.get("avg_state")
+        wave_speeds = self.get("wave_speeds")
+
+        if model_eqns != 3:
+            return
+
+        self.prohibit(avg_state is not None and avg_state != 2, "6-equation model (model_eqns = 3) requires avg_state = 2")
+        self.prohibit(wave_speeds is not None and wave_speeds != 1, "6-equation model (model_eqns = 3) requires wave_speeds = 1")
+
+    def check_bubbles_euler_simulation(self):
+        """Checks bubble constraints specific to simulation"""
+        bubbles_euler = self.get("bubbles_euler", "F") == "T"
+        bubbles_lagrange = self.get("bubbles_lagrange", "F") == "T"
+        riemann_solver = self.get("riemann_solver")
+        avg_state = self.get("avg_state")
+        model_eqns = self.get("model_eqns")
+        bubble_model = self.get("bubble_model")
+
+        self.prohibit(bubbles_euler and bubbles_lagrange, "Activate only one of the bubble subgrid models (bubbles_euler or bubbles_lagrange)")
+
+        if not bubbles_euler:
+            return
+
+        self.prohibit(riemann_solver is not None and riemann_solver != 2, "Bubble modeling requires HLLC Riemann solver (riemann_solver = 2)")
+        self.prohibit(avg_state is not None and avg_state != 2, "Bubble modeling requires arithmetic average (avg_state = 2)")
+        self.prohibit(model_eqns == 2 and bubble_model == 1, "The 5-equation bubbly flow model does not support bubble_model = 1 (Gilmore)")
+
+    def check_synthetic_turbulence(self):
+        """Checks constraints on synthetic-turbulence forcing zones (simulation)"""
+        if self.get("synthetic_turbulence", "F") != "T":
+            return
+
+        num_turbulent_sources = self.get("num_turbulent_sources", 0) or 0
+        self.prohibit(num_turbulent_sources <= 0, "num_turbulent_sources must be > 0 when synthetic_turbulence is enabled")
+
+        num_turb_sources_max = get_fortran_constants().get("num_turb_sources_max", 10)
+        self.prohibit(
+            num_turbulent_sources > num_turb_sources_max,
+            f"num_turbulent_sources must be <= {num_turb_sources_max} (num_turb_sources_max in m_constants.fpp)",
+        )
+
+        # Each active zone needs a position and a positive extent in every active
+        # dimension; the Fortran loops d = 1, num_dims, so trailing components of a
+        # lower-dimensional case are not required.
+        num_dims = 3 if (self.get("p", 0) or 0) > 0 else (2 if (self.get("n", 0) or 0) > 0 else 1)
+        for i in range(1, min(num_turbulent_sources, num_turb_sources_max) + 1):
+            for d in range(1, num_dims + 1):
+                self.prohibit(
+                    not self.is_set(f"turb_pos({i},{d})"),
+                    f"turb_pos({i},{d}) must be specified for all num_dims when synthetic_turbulence is enabled",
+                )
+                synth_l = self.get(f"synth_L({i},{d})")
+                self.prohibit(
+                    synth_l is None or (self._is_numeric(synth_l) and synth_l <= 0),
+                    f"synth_L({i},{d}) must be positive for all num_dims when synthetic_turbulence is enabled",
+                )
+
+    def check_body_forces(self):
+        """Checks constraints on body forces parameters"""
+        # Spatially supported forcing writes mom%beg and mom%beg+1 directly, so it is
+        # only defined for a 2D domain (n > 0 with p == 0).
+        bf_spatial_support = self.get("bf_spatial_support", "F") == "T"
+        n = self.get("n", 0) or 0
+        p = self.get("p", 0) or 0
+        self.prohibit(bf_spatial_support and (n == 0 or p != 0), "bf_spatial_support is implemented for 2D only (it forces mom%beg and mom%beg+1)")
+
+        for dir in ["x", "y", "z"]:
+            bf = self.get(f"bf_{dir}", "F") == "T"
+
+            if not bf:
+                continue
+
+            self.prohibit(self.get(f"k_{dir}") is None, f"k_{dir} must be specified if bf_{dir} is true")
+            self.prohibit(self.get(f"w_{dir}") is None, f"w_{dir} must be specified if bf_{dir} is true")
+            self.prohibit(self.get(f"p_{dir}") is None, f"p_{dir} must be specified if bf_{dir} is true")
+            self.prohibit(self.get(f"g_{dir}") is None, f"g_{dir} must be specified if bf_{dir} is true")
+
+    def check_viscosity(self):
+        """Checks constraints on viscosity parameters"""
+        viscous = self.get("viscous", "F") == "T"
+        num_fluids = self.get("num_fluids")
+        model_eqns = self.get("model_eqns")
+        weno_order = self.get("weno_order")
+        weno_avg = self.get("weno_avg", "F") == "T"
+        igr = self.get("igr", "F") == "T"
+
+        # If num_fluids is not set, check at least fluid 1 (for model_eqns=1)
+        if num_fluids is None:
+            num_fluids = 1
+
+        for i in range(1, num_fluids + 1):
+            Re1 = self.get(f"fluid_pp({i})%Re(1)")
+            Re2 = self.get(f"fluid_pp({i})%Re(2)")
+
+            for j, Re_val in [(1, Re1), (2, Re2)]:
+                if Re_val is not None:
+                    self.prohibit(Re_val <= 0, f"fluid_pp({i})%Re({j}) must be positive")
+                    self.prohibit(model_eqns == 1, f"model_eqns = 1 does not support fluid_pp({i})%Re({j})")
+                    if not igr:
+                        self.prohibit(weno_order == 1 and not weno_avg, f"weno_order = 1 without weno_avg does not support fluid_pp({i})%Re({j})")
+                    self.prohibit(not viscous, f"Re({j}) is specified, but viscous is not set to true")
+
+            # Check Re(1) requirement
+            self.prohibit(Re1 is None and viscous, f"viscous is set to true, but fluid_pp({i})%Re(1) is not specified")
+
+        # weno_Re_flux requires viscous
+        weno_Re_flux = self.get("weno_Re_flux", "F") == "T"
+        self.prohibit(weno_Re_flux and not viscous, "weno_Re_flux requires viscous to be enabled")
+
+    def check_non_newtonian(self):
+        """Checks constraints on non-Newtonian (Herschel-Bulkley) parameters (simulation)"""
+        num_fluids = self.get("num_fluids")
+        # If num_fluids is not set, check at least fluid 1 (for model_eqns=1)
+        if num_fluids is None:
+            num_fluids = 1
+
+        viscous = self.get("viscous", "F") == "T"
+        igr = self.get("igr", "F") == "T"
+        model_eqns = self.get("model_eqns")
+        riemann_solver = self.get("riemann_solver")
+
+        for i in range(1, num_fluids + 1):
+            if self.get(f"fluid_pp({i})%non_newtonian", "F") != "T":
+                for hb_param in ["K", "nn", "tau0", "hb_m", "mu_min", "mu_max", "mu_bulk"]:
+                    self.prohibit(
+                        self.get(f"fluid_pp({i})%{hb_param}") is not None,
+                        f"fluid_pp({i})%{hb_param} is set, but fluid_pp({i})%non_newtonian is not enabled",
+                    )
+                continue
+
+            self.prohibit(not viscous, f"fluid_pp({i})%non_newtonian requires viscous = T")
+            self.prohibit(self.get(f"fluid_pp({i})%K") is None, f"fluid_pp({i})%non_newtonian requires fluid_pp({i})%K to be set")
+            self.prohibit(self.get(f"fluid_pp({i})%nn") is None, f"fluid_pp({i})%non_newtonian requires fluid_pp({i})%nn to be set")
+            self.prohibit(self.get(f"fluid_pp({i})%mu_max") is None, f"fluid_pp({i})%non_newtonian requires fluid_pp({i})%mu_max to be set")
+
+            K = self.get(f"fluid_pp({i})%K")
+            nn = self.get(f"fluid_pp({i})%nn")
+            mu_min = self.get(f"fluid_pp({i})%mu_min")
+            mu_max = self.get(f"fluid_pp({i})%mu_max")
+            hb_m = self.get(f"fluid_pp({i})%hb_m")
+            tau0 = self.get(f"fluid_pp({i})%tau0", 0.0)
+
+            self.prohibit(K is not None and K <= 0, f"fluid_pp({i})%K must be positive")
+            self.prohibit(nn is not None and nn <= 0, f"fluid_pp({i})%nn must be positive")
+            self.prohibit(mu_max is not None and mu_max <= 0, f"fluid_pp({i})%mu_max must be positive")
+            self.prohibit(mu_min is not None and mu_min <= 0, f"fluid_pp({i})%mu_min must be positive")
+            self.prohibit(hb_m is not None and hb_m <= 0, f"fluid_pp({i})%hb_m must be positive")
+            self.prohibit(tau0 is not None and tau0 < 0, f"fluid_pp({i})%tau0 must be non-negative")
+
+            if tau0 is not None and tau0 > 0:
+                self.prohibit(hb_m is None, f"fluid_pp({i})%non_newtonian: tau0 > 0 requires fluid_pp({i})%hb_m to be set")
+
+            if mu_min is not None and mu_max is not None:
+                self.prohibit(mu_max <= mu_min, f"fluid_pp({i})%non_newtonian: mu_max must exceed mu_min")
+
+            self.prohibit(igr, f"fluid_pp({i})%non_newtonian is incompatible with igr")
+            self.prohibit(model_eqns is not None and model_eqns not in (2, 3), f"fluid_pp({i})%non_newtonian requires model_eqns 2 or 3")
+            self.prohibit(
+                riemann_solver is not None and riemann_solver not in (1, 2),
+                f"fluid_pp({i})%non_newtonian requires riemann_solver 1 (HLL) or 2 (HLLC)",
+            )
+            self.prohibit(
+                self.get(f"fluid_pp({i})%mu_bulk") is not None,
+                f"fluid_pp({i})%mu_bulk (non-Newtonian bulk viscosity) is not yet supported",
+            )
+            self.prohibit(
+                self.get(f"fluid_pp({i})%Re(2)") is not None,
+                f"fluid_pp({i})%Re(2) (bulk viscosity) is not supported for non-Newtonian fluids",
+            )
+
+    def check_mhd_simulation(self):
+        """Checks MHD constraints specific to simulation"""
+        mhd = self.get("mhd", "F") == "T"
+        riemann_solver = self.get("riemann_solver")
+        relativity = self.get("relativity", "F") == "T"
+        hyper_cleaning = self.get("hyper_cleaning", "F") == "T"
+        wave_speeds = self.get("wave_speeds")
+        n = self.get("n", 0)
+
+        self.prohibit(mhd and riemann_solver is not None and riemann_solver not in [1, 4], "MHD simulations require riemann_solver = 1 (HLL) or riemann_solver = 4 (HLLD)")
+        self.prohibit(mhd and wave_speeds is not None and wave_speeds == 2, "MHD requires wave_speeds = 1")
+        hypoelasticity = self.get("hypoelasticity", "F") == "T"
+        self.prohibit(riemann_solver == 4 and not mhd and not hypoelasticity, "HLLD (riemann_solver = 4) requires MHD or hypoelasticity")
+        self.prohibit(riemann_solver == 4 and relativity, "HLLD is not available for RMHD (relativity)")
+        self.prohibit(hyper_cleaning and not mhd, "Hyperbolic cleaning requires mhd to be enabled")
+        self.prohibit(hyper_cleaning and n is not None and n == 0, "Hyperbolic cleaning is not supported for 1D simulations")
+
+    def check_igr_simulation(self):
+        """Checks IGR constraints specific to simulation"""
+        igr = self.get("igr", "F") == "T"
+
+        if not igr:
+            return
+
+        num_igr_iters = self.get("num_igr_iters")
+        num_igr_warm_start_iters = self.get("num_igr_warm_start_iters")
+        igr_iter_solver = self.get("igr_iter_solver")
+        alf_factor = self.get("alf_factor")
+        model_eqns = self.get("model_eqns")
+        ib = self.get("ib", "F") == "T"
+        bubbles_euler = self.get("bubbles_euler", "F") == "T"
+        bubbles_lagrange = self.get("bubbles_lagrange", "F") == "T"
+        alt_soundspeed = self.get("alt_soundspeed", "F") == "T"
+        surface_tension = self.get("surface_tension", "F") == "T"
+        hypoelasticity = self.get("hypoelasticity", "F") == "T"
+        acoustic_source = self.get("acoustic_source", "F") == "T"
+        relax = self.get("relax", "F") == "T"
+        mhd = self.get("mhd", "F") == "T"
+        cyl_coord = self.get("cyl_coord", "F") == "T"
+        probe_wrt = self.get("probe_wrt", "F") == "T"
+        int_comp = self.get("int_comp", 0)
+
+        self.prohibit(num_igr_iters is not None and num_igr_iters < 0, "num_igr_iters must be greater than or equal to 0")
+        self.prohibit(num_igr_warm_start_iters is not None and num_igr_warm_start_iters < 0, "num_igr_warm_start_iters must be greater than or equal to 0")
+        self.prohibit(igr_iter_solver is not None and igr_iter_solver not in [1, 2], "igr_iter_solver must be 1 or 2")
+        self.prohibit(alf_factor is not None and alf_factor < 0, "alf_factor must be non-negative")
+        self.prohibit(model_eqns is not None and model_eqns != 2, "IGR only supports model_eqns = 2")
+        self.prohibit(ib, "IGR does not support the immersed boundary method")
+        self.prohibit(bubbles_euler, "IGR does not support Euler-Euler bubble models")
+        self.prohibit(bubbles_lagrange, "IGR does not support Euler-Lagrange bubble models")
+        self.prohibit(alt_soundspeed, "IGR does not support alt_soundspeed = T")
+        self.prohibit(surface_tension, "IGR does not support surface tension")
+        self.prohibit(hypoelasticity, "IGR does not support hypoelasticity")
+        self.prohibit(acoustic_source, "IGR does not support acoustic sources")
+        self.prohibit(relax, "IGR does not support phase change")
+        self.prohibit(mhd, "IGR does not support magnetohydrodynamics")
+        self.prohibit(cyl_coord, "IGR does not support cylindrical or axisymmetric coordinates")
+        self.prohibit(probe_wrt, "IGR does not support probe writes")
+        self.prohibit(int_comp > 0, "IGR does not support int_comp > 0")
+
+        # Check BCs - IGR does not support characteristic BCs
+        # Characteristic BCs are BC_CHAR_SLIP_WALL (-5) through BC_CHAR_SUP_OUTFLOW (-12)
+        for dir in ["x", "y", "z"]:
+            for bound in ["beg", "end"]:
+                bc = self.get(f"bc_{dir}%{bound}")
+                if bc is not None:
+                    self.prohibit(-12 <= bc <= -5, f"Characteristic boundary condition bc_{dir}%{bound} is not compatible with IGR")
+
+    def check_acoustic_source(self):
+        """Checks acoustic source parameters (simulation)"""
+        acoustic_source = self.get("acoustic_source", "F") == "T"
+
+        if not acoustic_source:
+            return
+
+        num_source = self.get("num_source")
+        n = self.get("n", 0)
+        p = self.get("p", 0)
+        cyl_coord = self.get("cyl_coord", "F") == "T"
+
+        # Determine dimensionality
+        if n is not None and n == 0:
+            dim = 1
+        elif p is not None and p == 0:
+            dim = 2
+        else:
+            dim = 3
+
+        self.prohibit(num_source is None, "num_source must be specified for acoustic_source")
+        self.prohibit(num_source is not None and num_source < 0, "num_source must be non-negative")
+
+        if num_source is None or num_source <= 0:
+            return
+
+        # Check each acoustic source
+        for j in range(1, num_source + 1):
+            jstr = str(j)
+
+            support = self.get(f"acoustic({j})%support")
+            loc = [self.get(f"acoustic({j})%loc({i})") for i in range(1, 4)]
+            mag = self.get(f"acoustic({j})%mag")
+            pulse = self.get(f"acoustic({j})%pulse")
+            frequency = self.get(f"acoustic({j})%frequency")
+            wavelength = self.get(f"acoustic({j})%wavelength")
+            gauss_sigma_time = self.get(f"acoustic({j})%gauss_sigma_time")
+            gauss_sigma_dist = self.get(f"acoustic({j})%gauss_sigma_dist")
+            bb_num_freq = self.get(f"acoustic({j})%bb_num_freq")
+            bb_bandwidth = self.get(f"acoustic({j})%bb_bandwidth")
+            bb_lowest_freq = self.get(f"acoustic({j})%bb_lowest_freq")
+            npulse = self.get(f"acoustic({j})%npulse")
+            dipole = self.get(f"acoustic({j})%dipole", "F") == "T"
+            dir_val = self.get(f"acoustic({j})%dir")
+            delay = self.get(f"acoustic({j})%delay")
+            length = self.get(f"acoustic({j})%length")
+            height = self.get(f"acoustic({j})%height")
+            foc_length = self.get(f"acoustic({j})%foc_length")
+            aperture = self.get(f"acoustic({j})%aperture")
+            num_elements = self.get(f"acoustic({j})%num_elements")
+            element_on = self.get(f"acoustic({j})%element_on")
+            element_spacing_angle = self.get(f"acoustic({j})%element_spacing_angle")
+            element_polygon_ratio = self.get(f"acoustic({j})%element_polygon_ratio")
+
+            self.prohibit(support is None, f"acoustic({jstr})%support must be specified for acoustic_source")
+
+            # Dimension-specific support checks (only if support was specified)
+            if support is not None:
+                if dim == 1:
+                    self.prohibit(support != 1, f"Only acoustic({jstr})%support = 1 is allowed for 1D simulations")
+                    self.prohibit(support == 1 and loc[0] is None, f"acoustic({jstr})%loc(1) must be specified for support = 1")
+
+                elif dim == 2:
+                    if cyl_coord:
+                        self.prohibit(support not in [2, 6, 10], f"Only acoustic({jstr})%support = 2, 6, or 10 is allowed for 2D axisymmetric")
+                    else:
+                        self.prohibit(support not in [2, 5, 6, 9, 10], f"Only acoustic({jstr})%support = 2, 5, 6, 9, or 10 is allowed for 2D")
+
+                    if support in [2, 5, 6, 9, 10]:
+                        self.prohibit(loc[0] is None or loc[1] is None, f"acoustic({jstr})%loc(1:2) must be specified for support = {support}")
+
+                elif dim == 3:
+                    self.prohibit(support not in [3, 7, 11], f"Only acoustic({jstr})%support = 3, 7, or 11 is allowed for 3D")
+                    self.prohibit(cyl_coord, "Acoustic source is not supported in 3D cylindrical simulations")
+
+                    if support == 3:
+                        self.prohibit(loc[0] is None or loc[1] is None, f"acoustic({jstr})%loc(1:2) must be specified for support = 3")
+                    elif support in [7, 11]:
+                        self.prohibit(loc[0] is None or loc[1] is None or loc[2] is None, f"acoustic({jstr})%loc(1:3) must be specified for support = {support}")
+
+            # Pulse parameters
+            self.prohibit(mag is None, f"acoustic({jstr})%mag must be specified")
+            self.prohibit(pulse is None, f"acoustic({jstr})%pulse must be specified")
+            self.prohibit(pulse is not None and pulse not in [1, 2, 3, 4], f"Only acoustic({jstr})%pulse = 1, 2, 3, or 4 is allowed")
+
+            # Pulse-specific requirements
+            if pulse in [1, 3]:
+                freq_set = frequency is not None
+                wave_set = wavelength is not None
+                self.prohibit(freq_set == wave_set, f"One and only one of acoustic({jstr})%frequency or wavelength must be specified for pulse = {pulse}")
+                # Physics: frequency and wavelength must be positive
+                self.prohibit(frequency is not None and frequency <= 0, f"acoustic({jstr})%frequency must be positive")
+                self.prohibit(wavelength is not None and wavelength <= 0, f"acoustic({jstr})%wavelength must be positive")
+
+            if pulse == 2:
+                time_set = gauss_sigma_time is not None
+                dist_set = gauss_sigma_dist is not None
+                self.prohibit(time_set == dist_set, f"One and only one of acoustic({jstr})%gauss_sigma_time or gauss_sigma_dist must be specified for pulse = 2")
+                self.prohibit(delay is None, f"acoustic({jstr})%delay must be specified for pulse = 2 (Gaussian)")
+                # Physics: gaussian parameters must be positive
+                self.prohibit(gauss_sigma_time is not None and gauss_sigma_time <= 0, f"acoustic({jstr})%gauss_sigma_time must be positive")
+                self.prohibit(gauss_sigma_dist is not None and gauss_sigma_dist <= 0, f"acoustic({jstr})%gauss_sigma_dist must be positive")
+
+            if pulse == 4:
+                self.prohibit(bb_num_freq is None, f"acoustic({jstr})%bb_num_freq must be specified for pulse = 4")
+                self.prohibit(bb_bandwidth is None, f"acoustic({jstr})%bb_bandwidth must be specified for pulse = 4")
+                self.prohibit(bb_lowest_freq is None, f"acoustic({jstr})%bb_lowest_freq must be specified for pulse = 4")
+
+            # npulse checks
+            self.prohibit(npulse is None, f"acoustic({jstr})%npulse must be specified")
+            self.prohibit(support is not None and support >= 5 and npulse is not None and not isinstance(npulse, int), f"acoustic({jstr})%npulse must be an integer for support >= 5 (non-planar)")
+            self.prohibit(npulse is not None and npulse >= 5 and dipole, f"acoustic({jstr})%dipole is not supported for npulse >= 5")
+            self.prohibit(support is not None and support < 5 and dir_val is None, f"acoustic({jstr})%dir must be specified for support < 5 (planar)")
+            self.prohibit(support == 1 and dir_val is not None and dir_val == 0, f"acoustic({jstr})%dir must be non-zero for support = 1")
+            self.prohibit(pulse == 3 and support is not None and support >= 5, f"acoustic({jstr})%support >= 5 is not allowed for pulse = 3 (square wave)")
+
+            # Geometry checks
+            if support in [2, 3]:
+                self.prohibit(length is None, f"acoustic({jstr})%length must be specified for support = {support}")
+                self.prohibit(length is not None and length <= 0, f"acoustic({jstr})%length must be positive for support = {support}")
+
+            if support == 3:
+                self.prohibit(height is None, f"acoustic({jstr})%height must be specified for support = 3")
+                self.prohibit(height is not None and height <= 0, f"acoustic({jstr})%height must be positive for support = 3")
+
+            if support is not None and support >= 5:
+                self.prohibit(foc_length is None, f"acoustic({jstr})%foc_length must be specified for support >= 5 (non-planar)")
+                self.prohibit(foc_length is not None and foc_length <= 0, f"acoustic({jstr})%foc_length must be positive for support >= 5")
+                self.prohibit(aperture is None, f"acoustic({jstr})%aperture must be specified for support >= 5 (non-planar)")
+                self.prohibit(aperture is not None and aperture <= 0, f"acoustic({jstr})%aperture must be positive for support >= 5")
+
+            # Transducer array checks
+            if support in [9, 10, 11]:
+                self.prohibit(num_elements is None, f"acoustic({jstr})%num_elements must be specified for support = {support} (transducer array)")
+                self.prohibit(num_elements is not None and num_elements <= 0, f"acoustic({jstr})%num_elements must be positive for support = {support}")
+                self.prohibit(element_on is not None and element_on < 0, f"acoustic({jstr})%element_on must be non-negative for support = {support}")
+                self.prohibit(element_on is not None and num_elements is not None and element_on > num_elements, f"acoustic({jstr})%element_on must be <= num_elements for support = {support}")
+
+            if support in [9, 10]:
+                self.prohibit(element_spacing_angle is None, f"acoustic({jstr})%element_spacing_angle must be specified for support = {support} (2D transducer)")
+                self.prohibit(element_spacing_angle is not None and element_spacing_angle < 0, f"acoustic({jstr})%element_spacing_angle must be non-negative for support = {support}")
+
+            if support == 11:
+                self.prohibit(element_polygon_ratio is None, f"acoustic({jstr})%element_polygon_ratio must be specified for support = 11 (3D transducer)")
+                self.prohibit(element_polygon_ratio is not None and element_polygon_ratio <= 0, f"acoustic({jstr})%element_polygon_ratio must be positive for support = 11")
+
+    def check_adaptive_time_stepping(self):
+        """Checks adaptive time stepping parameters (simulation)"""
+        adap_dt = self.get("adap_dt", "F") == "T"
+
+        if not adap_dt:
+            return
+
+        time_stepper = self.get("time_stepper")
+        model_eqns = self.get("model_eqns")
+        polytropic = self.get("polytropic", "F") == "T"
+        bubbles_lagrange = self.get("bubbles_lagrange", "F") == "T"
+        qbmm = self.get("qbmm", "F") == "T"
+        adv_n = self.get("adv_n", "F") == "T"
+
+        self.prohibit(time_stepper is not None and time_stepper != 3, "adap_dt requires Runge-Kutta 3 (time_stepper = 3)")
+        self.prohibit(model_eqns == 1, "adap_dt is not supported for model_eqns = 1")
+        self.prohibit(qbmm, "adap_dt is not compatible with qbmm")
+        self.prohibit(not polytropic and not bubbles_lagrange, "adap_dt requires polytropic = T or bubbles_lagrange = T")
+        self.prohibit(not adv_n and not bubbles_lagrange, "adap_dt requires adv_n = T or bubbles_lagrange = T")
+
+    def check_alt_soundspeed(self):
+        """Checks alternative sound speed parameters (simulation)"""
+        alt_soundspeed = self.get("alt_soundspeed", "F") == "T"
+
+        if not alt_soundspeed:
+            return
+
+        model_eqns = self.get("model_eqns")
+        bubbles_euler = self.get("bubbles_euler", "F") == "T"
+        avg_state = self.get("avg_state")
+        riemann_solver = self.get("riemann_solver")
+        num_fluids = self.get("num_fluids")
+        hll_u_interface = self.get("hll_u_interface", "F") == "T"
+        hypoelasticity = self.get("hypoelasticity", "F") == "T"
+        cyl_coord = self.get("cyl_coord", "F") == "T"
+        p = self.get("p", 0)
+
+        self.prohibit(model_eqns is not None and model_eqns != 2, "5-equation model (model_eqns = 2) is required for alt_soundspeed")
+        self.prohibit(bubbles_euler, "alt_soundspeed is not compatible with bubbles_euler")
+        self.prohibit(avg_state is not None and avg_state != 2, "alt_soundspeed requires avg_state = 2")
+        self.prohibit(riemann_solver is not None and riemann_solver not in [1, 2, 4], "alt_soundspeed requires HLL (1), HLLC (2), or HLLD (4) Riemann solver")
+        self.prohibit(num_fluids is not None and num_fluids != 2, "alt_soundspeed requires exactly 2 fluid components (the Kapila K coefficient is a two-fluid closure)")
+        self.prohibit(riemann_solver == 1 and not hll_u_interface and cyl_coord and p == 0, "alt_soundspeed with HLL Method 1 is not supported for 2D axisymmetric geometry")
+        self.prohibit(riemann_solver == 1 and cyl_coord and p > 0, "alt_soundspeed with HLL is not currently supported for 3D cylindrical geometry")
+        self.prohibit(riemann_solver == 4 and not hypoelasticity, "alt_soundspeed with HLLD requires hypoelasticity = T")
+
+    def check_bubbles_lagrange(self):
+        """Checks Lagrangian bubble parameters (simulation)"""
+        bubbles_lagrange = self.get("bubbles_lagrange", "F") == "T"
+
+        if not bubbles_lagrange:
+            return
+
+        n = self.get("n", 0)
+        p = self.get("p", 0)
+        file_per_process = self.get("file_per_process", "F") == "T"
+        model_eqns = self.get("model_eqns")
+        cluster_type = self.get("lag_params%cluster_type")
+        smooth_type = self.get("lag_params%smooth_type")
+        polytropic = self.get("polytropic", "F") == "T"
+        thermal = self.get("thermal")
+        vel_model = self.get("lag_params%vel_model", 0)
+        drag_model = self.get("lag_params%drag_model", 0)
+        charNz = self.get("lag_params%charNz", 0)
+        charWidth = self.get("lag_params%charwidth", 0)
+        fd_order = self.get("fd_order", 0)
+        kahan_summation = self.get("lag_params%kahan_summation", "T") == "T"
+
+        self.prohibit(n is not None and n == 0, "bubbles_lagrange accepts 2D and 3D simulations only")
+        self.prohibit(file_per_process, "file_per_process must be false for bubbles_lagrange")
+        self.prohibit(model_eqns == 3, "The 6-equation flow model does not support bubbles_lagrange")
+        self.prohibit(polytropic, "bubbles_lagrange requires polytropic = F")
+        self.prohibit(thermal is not None and thermal != 3, "bubbles_lagrange requires thermal = 3")
+        self.prohibit(cluster_type is not None and cluster_type >= 2 and smooth_type != 1, "cluster_type >= 2 requires smooth_type = 1")
+        self.prohibit(vel_model < 0 or vel_model > 2, "lag_params%vel_model must be 0, 1, or 2")
+        self.prohibit(drag_model < 0 or drag_model > 3, "lag_params%drag_model must be 0, 1, 2, or 3")
+        self.prohibit(charNz <= 0 and p == 0, "lag_params%charNz must be positive for 2D bubbles_lagrange")
+        self.prohibit(charWidth <= 0 and p == 0, "lag_params%charwidth must be positive for 2D bubbles_lagrange")
+        self.prohibit(fd_order == 0 and vel_model > 0, "Non-zero lag_params%vel_model requires fd_order to be set")
+        self.prohibit(kahan_summation and CFG().mixed, "lag_params%kahan_summation = T is not compatible with --mixed precision")
+
+    def check_continuum_damage(self):
+        """Checks continuum damage model parameters (simulation)"""
+        cont_damage = self.get("cont_damage", "F") == "T"
+
+        if not cont_damage:
+            return
+
+        tau_star = self.get("tau_star")
+        cont_damage_s = self.get("cont_damage_s")
+        alpha_bar = self.get("alpha_bar")
+        model_eqns = self.get("model_eqns")
+        alt_soundspeed = self.get("alt_soundspeed", "F") == "T"
+        hypoelasticity = self.get("hypoelasticity", "F") == "T"
+
+        self.prohibit(not hypoelasticity, "cont_damage requires hypoelasticity = T")
+        self.prohibit(tau_star is None, "tau_star must be specified for cont_damage")
+        self.prohibit(cont_damage_s is None, "cont_damage_s must be specified for cont_damage")
+        self.prohibit(alpha_bar is None, "alpha_bar must be specified for cont_damage")
+        self.prohibit(tau_star is not None and tau_star < 0, "tau_star must be nonnegative (tensile damage threshold)")
+        self.prohibit(cont_damage_s is not None and cont_damage_s <= 0, "cont_damage_s must be positive")
+        self.prohibit(alpha_bar is not None and alpha_bar < 0, "alpha_bar must be nonnegative")
+        self.prohibit(model_eqns is not None and model_eqns != 2, "cont_damage requires model_eqns = 2")
+        self.prohibit(alt_soundspeed, "Continuum damage does not support alt_soundspeed")
+
+    def check_grcbc(self):
+        """Checks Generalized Relaxation Characteristics BC (simulation)"""
+        for dir in ["x", "y", "z"]:
+            grcbc_in = self.get(f"bc_{dir}%grcbc_in", "F") == "T"
+            grcbc_out = self.get(f"bc_{dir}%grcbc_out", "F") == "T"
+            grcbc_vel_out = self.get(f"bc_{dir}%grcbc_vel_out", "F") == "T"
+            bc_beg = self.get(f"bc_{dir}%beg")
+            bc_end = self.get(f"bc_{dir}%end")
+
+            if grcbc_in:
+                # Check if EITHER beg OR end is set to -7
+                self.prohibit(bc_beg != -7 and bc_end != -7, f"Subsonic Inflow (grcbc_in) requires bc_{dir}%beg = -7 or bc_{dir}%end = -7")
+                # The relaxation drives the boundary towards a prescribed state, so that state has to be given in
+                # full. An unset component keeps its default sentinel and the boundary diverges over a few hundred
+                # steps rather than failing outright, which is a hard failure to read backwards from an ICFL abort.
+                num_fluids = self.get("num_fluids", 1)
+                # s_initialize_cbc_module copies vel_in(1..num_dims) and the kernel reads them through
+                # dir_idx, which is (2,1,3) for a y inflow and (3,1,2) for z -- so requiring only
+                # component 1 would leave the normal velocity of a y or z inflow unchecked.
+                num_dims = 3 if (self.get("p", 0) or 0) > 0 else (2 if (self.get("n", 0) or 0) > 0 else 1)
+                missing = [n for n in (f"bc_{dir}%pres_in",) if self.get(n) is None]
+                missing += [f"bc_{dir}%vel_in({d})" for d in range(1, num_dims + 1) if self.get(f"bc_{dir}%vel_in({d})") is None]
+                missing += [f"bc_{dir}%alpha_rho_in({i})" for i in range(1, num_fluids + 1) if self.get(f"bc_{dir}%alpha_rho_in({i})") is None]
+                missing += [f"bc_{dir}%alpha_in({i})" for i in range(1, num_fluids + 1) if self.get(f"bc_{dir}%alpha_in({i})") is None]
+                self.prohibit(len(missing) > 0, f"Subsonic Inflow (grcbc_in) needs the full inflow state; missing {', '.join(missing)}")
+            if grcbc_out:
+                # Check if EITHER beg OR end is set to -8
+                self.prohibit(bc_beg != -8 and bc_end != -8, f"Subsonic Outflow (grcbc_out) requires bc_{dir}%beg = -8 or bc_{dir}%end = -8")
+                # m_cbc.fpp relaxes the outflow toward this pressure. One branch serves the beg and end
+                # sides alike -- both write L(adv%end), and sign(1, cbc_loc) picks the side -- so this is
+                # required whichever side carries the -8:
+                #   L(adv%end) = c*(1 - Ma)*(pres - pres_out(dir))/Del_out(dir)
+                # Left unset it relaxes toward an undefined target, which is silent: the boundary cell simply
+                # walks away, and the run aborts on ICFL tens of steps later with nothing pointing at the BC.
+                self.prohibit(
+                    not self.is_set(f"bc_{dir}%pres_out"),
+                    f"bc_{dir}%pres_out must be specified when bc_{dir}%grcbc_out is enabled",
+                )
+            if grcbc_vel_out:
+                self.prohibit(bc_beg != -8 and bc_end != -8, f"Subsonic Outflow Velocity (grcbc_vel_out) requires bc_{dir}%beg = -8 or bc_{dir}%end = -8")
+                # Only the NORMAL component is read here:
+                #   L(adv%end) += rho*c^2*(1 - Ma)*(vel(dir_idx(1)) + vel_out(dir, dir_idx(1))*sign(1, cbc_loc))/Del_out(dir)
+                # and dir_idx(1) is 1 for x, 2 for y, 3 for z (m_cbc.fpp:942-948). The transverse components
+                # are read by grcbc_in's inflow branch, not by this one, so requiring them here would reject
+                # configurations that run correctly.
+                normal = {"x": 1, "y": 2, "z": 3}[dir]
+                self.prohibit(
+                    not self.is_set(f"bc_{dir}%vel_out({normal})"),
+                    f"bc_{dir}%vel_out({normal}) must be specified when bc_{dir}%grcbc_vel_out is enabled",
+                )
+
+    def check_probe_output(self):
+        """Checks probe output requirements (simulation)"""
+        probe_wrt = self.get("probe_wrt", "F") == "T"
+        fd_order = self.get("fd_order")
+
+        self.prohibit(probe_wrt and fd_order is None, "fd_order must be specified for probe_wrt")
+
+    # Pre-Process Specific Checks
+
+    def check_restart(self):
+        """Checks constraints on restart parameters (pre-process)"""
+        old_grid = self.get("old_grid", "F") == "T"
+        old_ic = self.get("old_ic", "F") == "T"
+        t_step_old = self.get("t_step_old")
+        num_patches = self.get("num_patches", 0)
+
+        self.prohibit(not old_grid and old_ic, "old_ic can only be enabled with old_grid enabled")
+        self.prohibit(old_grid and t_step_old is None, "old_grid requires t_step_old to be set")
+        self.prohibit(num_patches < 0, "num_patches must be non-negative")
+        self.prohibit(num_patches == 0 and t_step_old is None, "num_patches must be positive for the non-restart case")
+        num_patches_max = get_fortran_constants().get("num_patches_max", 1000)
+        self.prohibit(
+            num_patches > num_patches_max,
+            f"num_patches must be <= {num_patches_max} (num_patches_max in m_constants.fpp)",
+        )
+
+    def check_domain_extents(self):
+        """Checks that the physical extents of every active dimension are set (pre-process)
+
+        The grid generator needs (xyz)_domain%beg and (xyz)_domain%end for each
+        dimension that has cells. On a restart (old_grid = T) the mesh is read
+        from the existing grid files, so the extents are neither needed nor read.
+        """
+        if self.get("old_grid", "F") == "T":
+            return
+
+        m = self.get("m", 0)
+        if self._is_numeric(m) and m > 0:
+            self.prohibit(not self.is_set("x_domain%beg"), "x_domain%beg must be set when m > 0")
+            self.prohibit(not self.is_set("x_domain%end"), "x_domain%end must be set when m > 0")
+
+        n = self.get("n", 0)
+        if self._is_numeric(n) and n > 0:
+            self.prohibit(not self.is_set("y_domain%beg"), "y_domain%beg must be set when n > 0")
+            self.prohibit(not self.is_set("y_domain%end"), "y_domain%end must be set when n > 0")
+
+        p = self.get("p", 0)
+        if self._is_numeric(p) and p > 0:
+            self.prohibit(not self.is_set("z_domain%beg"), "z_domain%beg must be set when p > 0")
+            self.prohibit(not self.is_set("z_domain%end"), "z_domain%end must be set when p > 0")
+
+    def check_qbmm_pre_process(self):
+        """Checks QBMM constraints for pre-process"""
+        qbmm = self.get("qbmm", "F") == "T"
+        dist_type = self.get("dist_type")
+        rhoRV = self.get("rhoRV")
+
+        if not qbmm:
+            return
+
+        self.prohibit(dist_type is None, "dist_type must be set if using QBMM")
+        self.prohibit(dist_type is not None and dist_type != 1 and rhoRV is not None and rhoRV > 0, "rhoRV cannot be used with dist_type != 1")
+
+    def check_parallel_io_pre_process(self):
+        """Checks parallel I/O constraints (pre-process)"""
+        parallel_io = self.get("parallel_io", "F") == "T"
+        down_sample = self.get("down_sample", "F") == "T"
+        igr = self.get("igr", "F") == "T"
+        p = self.get("p", 0)
+        file_per_process = self.get("file_per_process", "F") == "T"
+        m = self.get("m", 0)
+        n = self.get("n", 0)
+
+        if down_sample:
+            self.prohibit(not parallel_io, "down sample requires parallel_io = T")
+            self.prohibit(not igr, "down sample requires igr = T")
+            self.prohibit(p == 0, "down sample requires 3D (p > 0)")
+            self.prohibit(not file_per_process, "down sample requires file_per_process = T")
+            if m is not None and m >= 0:
+                self.prohibit((m + 1) % 3 != 0, "down sample requires m divisible by 3")
+            if n is not None and n >= 0:
+                self.prohibit((n + 1) % 3 != 0, "down sample requires n divisible by 3")
+            if p is not None and p >= 0:
+                self.prohibit((p + 1) % 3 != 0, "down sample requires p divisible by 3")
+
+    def check_grid_stretching(self):
+        """Checks grid stretching constraints (pre-process)"""
+        loops_x = self.get("loops_x", 1)
+        loops_y = self.get("loops_y", 1)
+        stretch_y = self.get("stretch_y", "F") == "T"
+        stretch_z = self.get("stretch_z", "F") == "T"
+        old_grid = self.get("old_grid", "F") == "T"
+        n = self.get("n", 0)
+        p = self.get("p", 0)
+        cyl_coord = self.get("cyl_coord", "F") == "T"
+
+        self.prohibit(loops_x < 1, "loops_x must be at least 1")
+        self.prohibit(loops_y < 1, "loops_y must be at least 1")
+        self.prohibit(stretch_y and n == 0, "stretch_y requires n > 0")
+        self.prohibit(stretch_z and p == 0, "stretch_z requires p > 0")
+        self.prohibit(stretch_z and cyl_coord, "stretch_z is not compatible with cylindrical coordinates")
+
+        for direction in ["x", "y", "z"]:
+            stretch = self.get(f"stretch_{direction}", "F") == "T"
+            if not stretch:
+                continue
+
+            a = self.get(f"a_{direction}")
+            coord_a = self.get(f"{direction}_a")
+            coord_b = self.get(f"{direction}_b")
+
+            self.prohibit(old_grid, f"old_grid and stretch_{direction} are incompatible")
+            self.prohibit(a is None, f"a_{direction} must be set with stretch_{direction} enabled")
+            self.prohibit(coord_a is None, f"{direction}_a must be set with stretch_{direction} enabled")
+            self.prohibit(coord_b is None, f"{direction}_b must be set with stretch_{direction} enabled")
+            if coord_a is not None and coord_b is not None:
+                self.prohibit(coord_a >= coord_b, f"{direction}_a must be less than {direction}_b with stretch_{direction} enabled")
+
+    def check_perturb_density(self):
+        """Checks initial partial density perturbation constraints (pre-process)"""
+        perturb_flow = self.get("perturb_flow", "F") == "T"
+        perturb_flow_fluid = self.get("perturb_flow_fluid")
+        perturb_flow_mag = self.get("perturb_flow_mag")
+        perturb_sph = self.get("perturb_sph", "F") == "T"
+        perturb_sph_fluid = self.get("perturb_sph_fluid")
+        num_fluids = self.get("num_fluids")
+
+        if perturb_flow:
+            self.prohibit(perturb_flow_fluid is None or perturb_flow_mag is None, "perturb_flow_fluid and perturb_flow_mag must be set with perturb_flow = T")
+        else:
+            self.prohibit(perturb_flow_fluid is not None or perturb_flow_mag is not None, "perturb_flow_fluid and perturb_flow_mag must not be set with perturb_flow = F")
+
+        if num_fluids is not None and perturb_flow_fluid is not None:
+            self.prohibit(perturb_flow_fluid > num_fluids or perturb_flow_fluid < 0, "perturb_flow_fluid must be between 0 and num_fluids")
+
+        if perturb_sph:
+            self.prohibit(perturb_sph_fluid is None, "perturb_sph_fluid must be set with perturb_sph = T")
+        else:
+            self.prohibit(perturb_sph_fluid is not None, "perturb_sph_fluid must not be set with perturb_sph = F")
+
+        if num_fluids is not None and perturb_sph_fluid is not None:
+            self.prohibit(perturb_sph_fluid > num_fluids or perturb_sph_fluid < 0, "perturb_sph_fluid must be between 0 and num_fluids")
+
+    def check_chemistry(self):
+        """Checks chemistry constraints (pre-process)
+
+        Note: num_species is set automatically by Cantera at runtime when cantera_file
+        is provided. No static validation is performed here - chemistry will fail at
+        runtime if misconfigured.
+        """
+        # Fetch global chemistry and diffusion flags
+        chemistry = self.get("chemistry", "F") == "T"
+        diffusion = self.get("chem_params%diffusion", "F") == "T"
+        num_fluids = self.get("num_fluids")
+
+        # Chemistry assumes a single reacting gas phase: the temperature/pressure
+        # inversion recovers T from the total internal energy via Cantera's ideal-gas
+        # EOS (ignoring pi_inf), and the cons->prim conversion collapses all partial
+        # densities onto the species-summed total density. Both are only correct for
+        # num_fluids = 1; with a second (e.g. stiffened-gas) fluid the state is
+        # inconsistent and the simulation NaNs. See MFlowCode/MFC#1470.
+        self.prohibit(chemistry and num_fluids is not None and num_fluids != 1, "chemistry is only supported for single-component flows (num_fluids = 1)")
+
+        # Chemistry with Euler bubbles is not currently supported: the IBM image-point
+        # interpolation branch selects the bubbles/QBMM path before the chemistry path, so
+        # the species state is not carried when both are enabled. Disallow the combination
+        # until it is implemented.
+        bubbles_euler = self.get("bubbles_euler", "F") == "T"
+        qbmm = self.get("qbmm", "F") == "T"
+        self.prohibit(chemistry and (bubbles_euler or qbmm), "chemistry is not currently supported with Euler bubbles (bubbles_euler / qbmm)")
+
+        # Operator-split reaction sub-stepping. The Fortran defaults are
+        # reaction_substeps = reaction_substeps_max = 0 and adap_substeps = F, so an
+        # unset value is treated as 0 here to match.
+        igr = self.get("igr", "F") == "T"
+        adap_substeps = self.get("chem_params%adap_substeps", "F") == "T"
+        reaction_substeps = self.get("chem_params%reaction_substeps", 0) or 0
+        reaction_substeps_max = self.get("chem_params%reaction_substeps_max", 0) or 0
+
+        self.prohibit(
+            chemistry and reaction_substeps < 0,
+            "chem_params%reaction_substeps must be >= 0 (0 = reaction source in the flow RHS; > 0 = operator-split sub-stepping)",
+        )
+        self.prohibit(
+            chemistry and igr and reaction_substeps > 0,
+            "operator-split reaction sub-stepping (reaction_substeps > 0) is not supported with igr: the reactor reads the post-flow (rho, e, T) state, which the IGR update path does not guarantee",
+        )
+        self.prohibit(
+            chemistry and adap_substeps and reaction_substeps < 1,
+            "chem_params%adap_substeps requires reaction_substeps >= 1 (the operator-split floor)",
+        )
+        self.prohibit(
+            chemistry and adap_substeps and reaction_substeps_max < reaction_substeps,
+            "chem_params%reaction_substeps_max must be >= reaction_substeps when adap_substeps = T",
+        )
+
+        # Define what constitutes a wall (-15 for slip, -16 for no-slip)
+        wall_bcs = [-15, -16]
+
+        for dir in ["x", "y", "z"]:
+            isothermal_in = self.get(f"bc_{dir}%isothermal_in", "F") == "T"
+            isothermal_out = self.get(f"bc_{dir}%isothermal_out", "F") == "T"
+            bc_beg = self.get(f"bc_{dir}%beg")
+            bc_end = self.get(f"bc_{dir}%end")
+
+            if isothermal_in:
+                # Prohibit isothermal boundaries if chemistry or diffusion are disabled
+                self.prohibit(not chemistry or not diffusion, f"Isothermal In (bc_{dir}%isothermal_in) requires both chemistry='T' and chem_params%diffusion='T' to calculate heat conduction.")
+
+                # Prohibit if neither beg nor end is set to a valid wall condition
+                self.prohibit(bc_beg not in wall_bcs, f"Isothermal In (bc_{dir}%isothermal_in) requires a wall. Set bc_{dir}%beg to -15 (slip) or -16 (no-slip).")
+
+                # Check that the wall temperature is defined and physically valid (> 0 K)
+                tw_in = self.get(f"bc_{dir}%Twall_in")
+                self.prohibit(tw_in is None, f"Isothermal In (bc_{dir}%isothermal_in) requires a wall temperature to be set (e.g., bc_{dir}%Twall_in).")
+                if tw_in is not None and self._is_numeric(tw_in):
+                    self.prohibit(tw_in <= 0.0, f"Wall temperature bc_{dir}%Twall_in must be strictly positive for thermodynamics (got {tw_in}).")
+
+            if isothermal_out:
+                # Prohibit isothermal boundaries if chemistry or diffusion are disabled
+                self.prohibit(not chemistry or not diffusion, f"Isothermal Out (bc_{dir}%isothermal_out) requires both chemistry='T' and chem_params%diffusion='T' to calculate heat conduction.")
+
+                # Prohibit if neither beg nor end is set to a valid wall condition
+                self.prohibit(bc_end not in wall_bcs, f"Isothermal Out (bc_{dir}%isothermal_out) requires a wall. Set bc_{dir}%end to -15 (slip) or -16 (no-slip).")
+
+                # Check that the wall temperature is defined and physically valid (> 0 K)
+                tw_out = self.get(f"bc_{dir}%Twall_out")
+                self.prohibit(tw_out is None, f"Isothermal Out (bc_{dir}%isothermal_out) requires a wall temperature to be set (e.g., bc_{dir}%Twall_out).")
+                if tw_out is not None and self._is_numeric(tw_out):
+                    self.prohibit(tw_out <= 0.0, f"Wall temperature bc_{dir}%Twall_out must be strictly positive for thermodynamics (got {tw_out}).")
+
+    def check_reactive_burn(self):
+        """Checks condensed-phase reactive-burn constraints"""
+        reactive_burn = self.get("reactive_burn", "F") == "T"
+        if not reactive_burn:
+            return
+        # These mirror Fortran checks that compared against the dflt_real / dflt_int
+        # sentinels, so an unset parameter was a violation there. A bare
+        # "is not None" guard would silently pass the unset case instead.
+        model_eqns = self.get("model_eqns")
+        # Supported on the 5-equation (pressure-equilibrium) and 6-equation multi-fluid models.
+        self.prohibit(model_eqns not in (2, 3), "reactive_burn requires model_eqns = 2 or 3 (5- or 6-equation multi-fluid model) to be set")
+
+        # Exactly two fluids (reactant = 1, product = 2) sharing the stiffened-gas EOS and
+        # differing only in qv; violating these silently corrupts the mass/energy balance.
+        self.prohibit(self.get("num_fluids") != 2, "reactive_burn requires num_fluids = 2 (reactant then product) to be set")
+        # A state-dependent family carries its own curve; the shared-EOS check is a stiffened-gas one.
+        names = CONSTRAINTS["fluid_pp(1)%eos"]["names"]
+        state_dependent = any(self.get(f"fluid_pp({k})%eos") in (names["mie_gruneisen"], names["jwl"], names["vinet"]) for k in (1, 2))
+        for prop in () if state_dependent else ("gamma", "pi_inf"):
+            v1 = self.get(f"fluid_pp(1)%{prop}")
+            v2 = self.get(f"fluid_pp(2)%{prop}")
+            if not self._is_numeric(v1) or not self._is_numeric(v2):
+                # Unset defaults to dflt_real in the solver, so a missing value is
+                # either a negative EOS or a mismatch against the fluid that is set.
+                self.prohibit(True, f"reactive_burn requires both fluid_pp(1)%{prop} and fluid_pp(2)%{prop} to be set (reactant and product share the EOS)")
+                continue
+            self.prohibit(
+                not math.isclose(v1, v2, rel_tol=1e-10),
+                f"reactive_burn requires fluid_pp(1)%{prop} == fluid_pp(2)%{prop} (reactant and product share the EOS)",
+            )
+        # qv defaults to 0 in the Fortran, so an unset value is treated as 0 here to match.
+        qv1 = self.get("fluid_pp(1)%qv", 0.0)
+        qv2 = self.get("fluid_pp(2)%qv", 0.0)
+        self.prohibit(
+            self._is_numeric(qv1) and self._is_numeric(qv2) and qv1 <= qv2,
+            "reactive_burn requires fluid_pp(1)%qv > fluid_pp(2)%qv (reactant releases energy on conversion to product)",
+        )
+        # The rate uses rburn%k, %pign, %pref, %n directly; an unset value defaults to a negative
+        # sentinel in the solver and silently corrupts the burn, so require each to be set.
+        rk = self.get("rburn%k")
+        self.prohibit(not self._is_numeric(rk) or rk <= 0, "reactive_burn requires rburn%k > 0 (rate coefficient [1/s])")
+        self.prohibit(self.get("rburn%pign") is None, "reactive_burn requires rburn%pign to be set (ignition pressure threshold [Pa])")
+        rpref = self.get("rburn%pref")
+        self.prohibit(not self._is_numeric(rpref) or rpref <= 0, "reactive_burn requires rburn%pref > 0 (it normalizes the pressure drive and is used as a divisor)")
+        rn = self.get("rburn%n")
+        self.prohibit(not self._is_numeric(rn) or rn < 0, "reactive_burn requires rburn%n >= 0 (pressure-drive exponent)")
+        rta = self.get("rburn%ta")
+        self.prohibit(self._is_numeric(rta) and rta < 0, "reactive_burn requires rburn%ta >= 0 (activation temperature [K]; 0 disables the Arrhenius factor)")
+        rsub = self.get("rburn%substeps")
+        self.prohibit(
+            self._is_numeric(rsub) and rsub < 0,
+            "reactive_burn requires rburn%substeps >= 0 (operator-split sub-steps per time step; 0 adds the source to the flow RHS)",
+        )
+        cv1 = self.get("fluid_pp(1)%cv")
+        self.prohibit(
+            self._is_numeric(rta) and rta > 0 and (not self._is_numeric(cv1) or cv1 <= 0),
+            "reactive_burn with rburn%ta > 0 requires fluid_pp(1)%cv > 0 (the reactant temperature needs a physical heat capacity; cv = 0 silently disables the Arrhenius factor)",
+        )
+
+    def check_misc_pre_process(self):
+        """Checks miscellaneous pre-process constraints"""
+        mixlayer_vel_profile = self.get("mixlayer_vel_profile", "F") == "T"
+        mixlayer_perturb = self.get("mixlayer_perturb", "F") == "T"
+        elliptic_smoothing = self.get("elliptic_smoothing", "F") == "T"
+        elliptic_smoothing_iters = self.get("elliptic_smoothing_iters")
+        n = self.get("n", 0)
+        p = self.get("p", 0)
+
+        self.prohibit(mixlayer_vel_profile and n == 0, "mixlayer_vel_profile requires n > 0")
+        self.prohibit(mixlayer_perturb and p == 0, "mixlayer_perturb requires p > 0")
+        if elliptic_smoothing and elliptic_smoothing_iters is not None:
+            self.prohibit(elliptic_smoothing_iters < 1, "elliptic_smoothing_iters must be positive")
+
+    def _is_numeric(self, value) -> bool:
+        """Check if value is numeric (not a string expression)."""
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def check_patch_physics(self):
+        """Checks physics constraints on patch initial conditions (pre-process).
+
+        Validates that initial conditions are physically meaningful:
+        - Pressure must be positive (thermodynamic requirement)
+        - Density (alpha_rho) must be positive
+        - Volume fractions must sum appropriately and be in [0, 1]
+        - Geometric dimensions must be positive
+
+        Note: String values (analytical expressions like "0.5*sin(x)") are
+        evaluated at runtime by Fortran and cannot be validated here.
+        """
+        num_patches = self.get("num_patches", 0)
+        num_fluids = self.get("num_fluids", 1)
+        bubbles_euler = self.get("bubbles_euler", "F") == "T"
+        num_ibs = self.get("num_ibs", 0) or 0  # IBM (Immersed Boundary Method)
+
+        if not self._is_numeric(num_patches) or num_patches <= 0:
+            return
+
+        for i in range(1, num_patches + 1):
+            istr = str(i)
+            geometry = self.get(f"patch_icpp({i})%geometry")
+
+            # Skip if patch not defined
+            if geometry is None:
+                continue
+
+            # Skip thermodynamic validation for special patches:
+            # - alter_patch patches (modifications to other patches)
+            # - hcid patches (hard-coded initial conditions computed at runtime)
+            hcid = self.get(f"patch_icpp({i})%hcid")
+            alter_patches = [self.get(f"patch_icpp({i})%alter_patch({j})") == "T" for j in range(1, num_patches + 1)]
+            is_special = hcid is not None or any(alter_patches)
+
+            # THERMODYNAMICS
+            # Pressure must be positive for physical stability
+            # (skip for special patches where values are computed differently)
+            if not is_special:
+                pres = self.get(f"patch_icpp({i})%pres")
+                if pres is not None and self._is_numeric(pres):
+                    self.prohibit(pres <= 0, f"patch_icpp({istr})%pres must be positive (got {pres})")
+
+            # FLUID PROPERTIES
+            # (skip for special patches where values are computed differently)
+            if not is_special:
+                for j in range(1, num_fluids + 1):
+                    jstr = str(j)
+
+                    # Volume fraction must be in [0, 1] (or non-negative for IBM cases)
+                    alpha = self.get(f"patch_icpp({i})%alpha({j})")
+                    if alpha is not None and self._is_numeric(alpha):
+                        self.prohibit(alpha < 0, f"patch_icpp({istr})%alpha({jstr}) must be non-negative (got {alpha})")
+                        # For non-IBM cases, alpha should be in [0, 1]
+                        if num_ibs == 0:
+                            self.prohibit(alpha > 1, f"patch_icpp({istr})%alpha({jstr}) must be <= 1 (got {alpha})")
+
+                    # Density (alpha_rho) must be non-negative
+                    # Note: alpha_rho = 0 is allowed for vacuum regions and numerical convenience
+                    alpha_rho = self.get(f"patch_icpp({i})%alpha_rho({j})")
+                    if alpha_rho is not None and self._is_numeric(alpha_rho):
+                        self.prohibit(alpha_rho < 0, f"patch_icpp({istr})%alpha_rho({jstr}) must be non-negative (got {alpha_rho})")
+
+            # GEOMETRY
+            # Patch dimensions must be positive (except in cylindrical coords where
+            # length_y/length_z can be sentinel values like -1000000.0)
+            length_x = self.get(f"patch_icpp({i})%length_x")
+            length_y = self.get(f"patch_icpp({i})%length_y")
+            length_z = self.get(f"patch_icpp({i})%length_z")
+            radius = self.get(f"patch_icpp({i})%radius")
+            cyl_coord = self.get("cyl_coord", "F") == "T"
+
+            if length_x is not None and self._is_numeric(length_x):
+                self.prohibit(length_x <= 0, f"patch_icpp({istr})%length_x must be positive (got {length_x})")
+            # In cylindrical coordinates, length_y and length_z can be negative sentinel values
+            if length_y is not None and self._is_numeric(length_y) and not cyl_coord:
+                self.prohibit(length_y <= 0, f"patch_icpp({istr})%length_y must be positive (got {length_y})")
+            if length_z is not None and self._is_numeric(length_z) and not cyl_coord:
+                self.prohibit(length_z <= 0, f"patch_icpp({istr})%length_z must be positive (got {length_z})")
+            if radius is not None and self._is_numeric(radius):
+                self.prohibit(radius <= 0, f"patch_icpp({istr})%radius must be positive (got {radius})")
+
+            # BUBBLES
+            # Bubble radius must be positive
+            if bubbles_euler:
+                r0 = self.get(f"patch_icpp({i})%r0")
+                if r0 is not None and self._is_numeric(r0):
+                    self.prohibit(r0 <= 0, f"patch_icpp({istr})%r0 must be positive (got {r0})")
+
+    def check_bc_patches(self):
+        """Checks boundary condition patch geometry (pre-process)"""
+        num_bc_patches = self.get("num_bc_patches", 0)
+        num_bc_patches_max = get_fortran_constants().get("num_bc_patches_max", 10)
+
+        if num_bc_patches <= 0:
+            return
+
+        self.prohibit(num_bc_patches > num_bc_patches_max, f"num_bc_patches must be <= {num_bc_patches_max}")
+
+        for i in range(1, num_bc_patches + 1):
+            geometry = self.get(f"patch_bc({i})%geometry")
+            bc_type = self.get(f"patch_bc({i})%type")
+            direction = self.get(f"patch_bc({i})%dir")
+            radius = self.get(f"patch_bc({i})%radius")
+            centroid = [self.get(f"patch_bc({i})%centroid({j})") for j in range(1, 4)]
+            length = [self.get(f"patch_bc({i})%length({j})") for j in range(1, 4)]
+
+            if geometry is None:
+                continue
+
+            # s_apply_boundary_patches dispatches by dimensionality: geometry 1 in 2D, 2 or 3 in 3D. A
+            # geometry that belongs to the other case falls through the dispatch, the patch is never applied,
+            # and the face silently keeps whatever bc_[xyz] gave it -- a nozzle cut into a wall simply stays a
+            # wall, with no warning and a jet that never starts.
+            p = self.get("p", 0) or 0
+            n = self.get("n", 0) or 0
+            if p > 0:
+                self.prohibit(geometry not in (2, 3), f"patch_bc({i})%geometry must be 2 (circle) or 3 (rectangle) in 3D; " f"geometry {geometry} is never applied")
+            elif n > 0:
+                self.prohibit(geometry != 1, f"patch_bc({i})%geometry must be 1 (line segment) in 2D; " f"geometry {geometry} is never applied")
+            else:
+                # 1D enters neither branch of the dispatch, so every geometry is ignored, not just a mismatched one.
+                self.prohibit(True, f"patch_bc({i})%geometry cannot be used in 1D; boundary-condition patches are only applied in 2D and 3D")
+
+            # Line Segment BC (geometry = 1)
+            if geometry == 1:
+                self.prohibit(radius is not None, f"Line Segment Patch {i} can't have radius defined")
+                if direction in [1, 2]:
+                    self.prohibit(centroid[direction - 1] is not None or centroid[2] is not None, f"Line Segment Patch {i} of Dir {direction} can't have centroid in Dir {direction} or 3")
+                    self.prohibit(length[direction - 1] is not None or length[2] is not None, f"Line Segment Patch {i} of Dir {direction} can't have length in Dir {direction} or 3")
+
+            # Circle BC (geometry = 2)
+            elif geometry == 2:
+                self.prohibit(radius is None, f"Circle Patch {i} must have radius defined")
+                self.prohibit(any(length_val is not None for length_val in length), f"Circle Patch {i} can't have lengths defined")
+                if direction in [1, 2, 3]:
+                    self.prohibit(centroid[direction - 1] is not None, f"Circle Patch {i} of Dir {direction} can't have centroid in Dir {direction}")
+
+            # Rectangle BC (geometry = 3)
+            elif geometry == 3:
+                self.prohibit(radius is not None, f"Rectangle Patch {i} can't have radius defined")
+                if direction in [1, 2, 3]:
+                    self.prohibit(centroid[direction - 1] is not None, f"Rectangle Patch {i} of Dir {direction} can't have centroid in Dir {direction}")
+                    self.prohibit(length[direction - 1] is not None, f"Rectangle Patch {i} of Dir {direction} can't have length in Dir {direction}")
+
+            # Check for incompatible BC types
+            if bc_type is not None:
+                # BC types -14 to -4, -1 (periodic), or < -17 (dirichlet) are incompatible with patches
+                self.prohibit((-14 <= bc_type <= -4) or bc_type == -1 or bc_type < -17, f"Incompatible BC type for boundary condition patch {i}")
+
+    # Post-Process Specific Checks
+
+    def check_output_format(self):
+        """Checks output format parameters (post-process)"""
+        format = self.get("format")
+        precision = self.get("precision")
+
+        if format is not None:
+            self.prohibit(format not in [1, 2], "format must be 1 or 2")
+
+        if precision is not None:
+            self.prohibit(precision not in [1, 2], "precision must be 1 or 2")
+            self.prohibit(precision == 2 and CFG().single, "precision = 2 (double output) requires MFC built without --single")
+
+    def check_vorticity(self):
+        """Checks vorticity parameters (post-process)"""
+        omega_wrt = [self.get(f"omega_wrt({i})", "F") == "T" for i in range(1, 4)]
+        n = self.get("n", 0)
+        p = self.get("p", 0)
+        fd_order = self.get("fd_order")
+
+        self.prohibit(n is not None and n == 0 and any(omega_wrt), "omega_wrt requires n > 0 (at least 2D)")
+        self.prohibit(p is not None and p == 0 and (omega_wrt[0] or omega_wrt[1]), "omega_wrt(1) and omega_wrt(2) require p > 0 (3D)")
+        self.prohibit(any(omega_wrt) and fd_order is None, "fd_order must be set for omega_wrt")
+
+    def check_schlieren(self):
+        """Checks schlieren parameters (post-process)"""
+        schlieren_wrt = self.get("schlieren_wrt", "F") == "T"
+        n = self.get("n", 0)
+        fd_order = self.get("fd_order")
+        num_fluids = self.get("num_fluids")
+        model_eqns = self.get("model_eqns")
+
+        self.prohibit(n is not None and n == 0 and schlieren_wrt, "schlieren_wrt requires n > 0 (at least 2D)")
+        self.prohibit(schlieren_wrt and fd_order is None, "fd_order must be set for schlieren_wrt")
+
+        # The volume-fraction model (model_eqns /= 1) weights the Schlieren field by schlieren_alpha(i) for every fluid; an unset
+        # value stays at the -1e6 sentinel and produces nonsensical output. Under IGR the last fluid's volume fraction is
+        # reconstructed (not stored), so schlieren_alpha must still be set for all num_fluids components, including the single
+        # fluid of a single-fluid IGR case. The gamma/pi_inf model (model_eqns == 1) does not use schlieren_alpha.
+        if num_fluids is not None:
+            for i in range(1, num_fluids + 1):
+                schlieren_alpha = self.get(f"schlieren_alpha({i})")
+                if schlieren_alpha is None:
+                    self.prohibit(
+                        schlieren_wrt and model_eqns is not None and model_eqns != 1,
+                        f"schlieren_alpha({i}) must be set for every fluid when schlieren_wrt is enabled (unless model_eqns == 1)",
+                    )
+                else:
+                    self.prohibit(schlieren_alpha <= 0, f"schlieren_alpha({i}) must be greater than zero")
+                    self.prohibit(not schlieren_wrt, f"schlieren_alpha({i}) should be set only with schlieren_wrt enabled")
+
+    def check_partial_domain(self):
+        """Checks partial domain output constraints (post-process)"""
+        output_partial_domain = self.get("output_partial_domain", "F") == "T"
+
+        if not output_partial_domain:
+            return
+
+        format_val = self.get("format")
+        precision = self.get("precision")
+        flux_wrt = self.get("flux_wrt", "F") == "T"
+        heat_ratio_wrt = self.get("heat_ratio_wrt", "F") == "T"
+        pres_inf_wrt = self.get("pres_inf_wrt", "F") == "T"
+        c_wrt = self.get("c_wrt", "F") == "T"
+        schlieren_wrt = self.get("schlieren_wrt", "F") == "T"
+        qm_wrt = self.get("qm_wrt", "F") == "T"
+        liutex_wrt = self.get("liutex_wrt", "F") == "T"
+        ib = self.get("ib", "F") == "T"
+        omega_wrt = [self.get(f"omega_wrt({i})", "F") == "T" for i in range(1, 4)]
+        n = self.get("n", 0)
+        p = self.get("p", 0)
+
+        self.prohibit(format_val == 1, "output_partial_domain requires format = 2")
+        self.prohibit(precision == 1, "output_partial_domain requires precision = 2")
+        self.prohibit(
+            flux_wrt or heat_ratio_wrt or pres_inf_wrt or c_wrt or schlieren_wrt or qm_wrt or liutex_wrt or ib or any(omega_wrt), "output_partial_domain is incompatible with certain output flags"
+        )
+
+        x_output_beg = self.get("x_output%beg")
+        x_output_end = self.get("x_output%end")
+        self.prohibit(x_output_beg is None or x_output_end is None, "x_output%beg and x_output%end must be set for output_partial_domain")
+
+        if n is not None and n != 0:
+            y_output_beg = self.get("y_output%beg")
+            y_output_end = self.get("y_output%end")
+            self.prohibit(y_output_beg is None or y_output_end is None, "y_output%beg and y_output%end must be set for output_partial_domain with n > 0")
+
+        if p is not None and p != 0:
+            z_output_beg = self.get("z_output%beg")
+            z_output_end = self.get("z_output%end")
+            self.prohibit(z_output_beg is None or z_output_end is None, "z_output%beg and z_output%end must be set for output_partial_domain with p > 0")
+
+        for direction in ["x", "y", "z"]:
+            beg = self.get(f"{direction}_output%beg")
+            end = self.get(f"{direction}_output%end")
+            if beg is not None and end is not None:
+                self.prohibit(beg > end, f"{direction}_output%beg must be <= {direction}_output%end")
+
+    def check_partial_density(self):
+        """Checks partial density output constraints (post-process)"""
+        num_fluids = self.get("num_fluids")
+        model_eqns = self.get("model_eqns")
+
+        if num_fluids is None:
+            return
+
+        for i in range(1, num_fluids + 1):
+            alpha_rho_wrt = self.get(f"alpha_rho_wrt({i})", "F") == "T"
+            if alpha_rho_wrt:
+                self.prohibit(model_eqns == 1, f"alpha_rho_wrt({i}) is not supported for model_eqns = 1")
+
+    def check_momentum_post(self):
+        """Checks momentum output constraints (post-process)"""
+        mom_wrt = [self.get(f"mom_wrt({i})", "F") == "T" for i in range(1, 4)]
+        n = self.get("n", 0)
+        p = self.get("p", 0)
+
+        self.prohibit(n == 0 and mom_wrt[1], "mom_wrt(2) requires n > 0")
+        self.prohibit(p == 0 and mom_wrt[2], "mom_wrt(3) requires p > 0")
+
+    def check_velocity_post(self):
+        """Checks velocity output constraints (post-process)"""
+        vel_wrt = [self.get(f"vel_wrt({i})", "F") == "T" for i in range(1, 4)]
+        n = self.get("n", 0)
+        p = self.get("p", 0)
+
+        self.prohibit(n == 0 and vel_wrt[1], "vel_wrt(2) requires n > 0")
+        self.prohibit(p == 0 and vel_wrt[2], "vel_wrt(3) requires p > 0")
+
+    def check_flux_limiter(self):
+        """Checks flux limiter constraints (post-process)"""
+        flux_wrt = [self.get(f"flux_wrt({i})", "F") == "T" for i in range(1, 4)]
+        flux_lim = self.get("flux_lim")
+        n = self.get("n", 0)
+        p = self.get("p", 0)
+
+        self.prohibit(n == 0 and flux_wrt[1], "flux_wrt(2) requires n > 0")
+        self.prohibit(p == 0 and flux_wrt[2], "flux_wrt(3) requires p > 0")
+
+        if flux_lim is not None:
+            self.prohibit(flux_lim not in [1, 2, 3, 4, 5, 6, 7], "flux_lim must be between 1 and 7")
+
+    def check_volume_fraction(self):
+        """Checks volume fraction output constraints (post-process)"""
+        num_fluids = self.get("num_fluids")
+        model_eqns = self.get("model_eqns")
+
+        if num_fluids is None:
+            return
+
+        for i in range(1, num_fluids + 1):
+            alpha_wrt = self.get(f"alpha_wrt({i})", "F") == "T"
+            if alpha_wrt:
+                self.prohibit(model_eqns == 1, f"alpha_wrt({i}) is not supported for model_eqns = 1")
+
+    def check_fft(self):
+        """Checks FFT output constraints (post-process)"""
+        fft_wrt = self.get("fft_wrt", "F") == "T"
+
+        if not fft_wrt:
+            return
+
+        n = self.get("n", 0)
+        p = self.get("p", 0)
+        cyl_coord = self.get("cyl_coord", "F") == "T"
+        m_glb = self.get("m_glb")
+        n_glb = self.get("n_glb")
+        p_glb = self.get("p_glb")
+
+        self.prohibit(n == 0 or p == 0, "FFT WRT only supported in 3D")
+        self.prohibit(cyl_coord, "FFT WRT incompatible with cylindrical coordinates")
+
+        if m_glb is not None and n_glb is not None and p_glb is not None:
+            self.prohibit((m_glb + 1) % 2 != 0 or (n_glb + 1) % 2 != 0 or (p_glb + 1) % 2 != 0, "FFT WRT requires global dimensions divisible by 2")
+
+        # BC checks: all boundaries must be periodic (-1)
+        for direction in ["x", "y", "z"]:
+            for end in ["beg", "end"]:
+                bc_val = self.get(f"bc_{direction}%{end}")
+                if bc_val is not None:
+                    self.prohibit(bc_val != -1, "FFT WRT requires periodic BCs (all BCs should be -1)")
+
+    def check_qm(self):
+        """Checks Q-criterion output constraints (post-process)"""
+        qm_wrt = self.get("qm_wrt", "F") == "T"
+        n = self.get("n", 0)
+
+        self.prohibit(n == 0 and qm_wrt, "qm_wrt requires n > 0 (at least 2D)")
+
+    def check_liutex_post(self):
+        """Checks liutex output constraints (post-process)"""
+        liutex_wrt = self.get("liutex_wrt", "F") == "T"
+        n = self.get("n", 0)
+
+        self.prohibit(n == 0 and liutex_wrt, "liutex_wrt requires n > 0 (at least 2D)")
+
+    def check_surface_tension_post(self):
+        """Checks surface tension output constraints (post-process)"""
+        cf_wrt = self.get("cf_wrt", "F") == "T"
+        surface_tension = self.get("surface_tension", "F") == "T"
+
+        self.prohibit(cf_wrt and not surface_tension, "cf_wrt can only be enabled if surface_tension is enabled")
+
+    def check_no_flow_variables(self):
+        """Checks that at least one flow variable is selected (post-process)"""
+        rho_wrt = self.get("rho_wrt", "F") == "T"
+        E_wrt = self.get("E_wrt", "F") == "T"
+        pres_wrt = self.get("pres_wrt", "F") == "T"
+        gamma_wrt = self.get("gamma_wrt", "F") == "T"
+        heat_ratio_wrt = self.get("heat_ratio_wrt", "F") == "T"
+        pi_inf_wrt = self.get("pi_inf_wrt", "F") == "T"
+        pres_inf_wrt = self.get("pres_inf_wrt", "F") == "T"
+        cons_vars_wrt = self.get("cons_vars_wrt", "F") == "T"
+        prim_vars_wrt = self.get("prim_vars_wrt", "F") == "T"
+        c_wrt = self.get("c_wrt", "F") == "T"
+        schlieren_wrt = self.get("schlieren_wrt", "F") == "T"
+
+        # Check array variables
+        num_fluids = self.get("num_fluids")
+        if num_fluids is None:
+            num_fluids = 1
+        alpha_rho_wrt_any = any(self.get(f"alpha_rho_wrt({i})", "F") == "T" for i in range(1, num_fluids + 1))
+        mom_wrt_any = any(self.get(f"mom_wrt({i})", "F") == "T" for i in range(1, 4))
+        vel_wrt_any = any(self.get(f"vel_wrt({i})", "F") == "T" for i in range(1, 4))
+        flux_wrt_any = any(self.get(f"flux_wrt({i})", "F") == "T" for i in range(1, 4))
+        alpha_wrt_any = any(self.get(f"alpha_wrt({i})", "F") == "T" for i in range(1, num_fluids + 1))
+        omega_wrt_any = any(self.get(f"omega_wrt({i})", "F") == "T" for i in range(1, 4))
+
+        has_output = (
+            rho_wrt
+            or E_wrt
+            or pres_wrt
+            or gamma_wrt
+            or heat_ratio_wrt
+            or pi_inf_wrt
+            or pres_inf_wrt
+            or cons_vars_wrt
+            or prim_vars_wrt
+            or c_wrt
+            or schlieren_wrt
+            or alpha_rho_wrt_any
+            or mom_wrt_any
+            or vel_wrt_any
+            or flux_wrt_any
+            or alpha_wrt_any
+            or omega_wrt_any
+        )
+
+        self.prohibit(not has_output, "None of the flow variables have been selected for post-process")
+
+    # Cross-Cutting Physics Checks
+
+    def check_domain_bounds(self):
+        """Checks that domain end > domain begin for each active dimension"""
+        x_beg = self.get("x_domain%beg")
+        x_end = self.get("x_domain%end")
+        if self._is_numeric(x_beg) and self._is_numeric(x_end):
+            self.prohibit(x_end <= x_beg, f"x_domain%end ({x_end}) must be greater than x_domain%beg ({x_beg})")
+
+        n = self.get("n", 0)
+        if self._is_numeric(n) and n > 0:
+            y_beg = self.get("y_domain%beg")
+            y_end = self.get("y_domain%end")
+            if self._is_numeric(y_beg) and self._is_numeric(y_end):
+                self.prohibit(y_end <= y_beg, f"y_domain%end ({y_end}) must be greater than y_domain%beg ({y_beg})")
+
+        p = self.get("p", 0)
+        if self._is_numeric(p) and p > 0:
+            z_beg = self.get("z_domain%beg")
+            z_end = self.get("z_domain%end")
+            if self._is_numeric(z_beg) and self._is_numeric(z_end):
+                self.prohibit(z_end <= z_beg, f"z_domain%end ({z_end}) must be greater than z_domain%beg ({z_beg})")
+
+    def check_volume_fraction_sum(self):
+        """Warns if volume fractions do not sum to 1 for multi-component models.
+
+        For model_eqns in [2, 3], the mixture constraint sum(alpha_j) = 1
+        must hold. Skips patches with analytical expressions, alter_patch,
+        hcid, bubbles_euler single-fluid cases (where alpha represents
+        the void fraction, not a partition of unity), and bubbles_lagrange
+        cases (where the Lagrangian phase is not tracked on the Euler grid).
+        """
+        model_eqns = self.get("model_eqns")
+        if model_eqns not in [2, 3]:
+            return
+
+        num_patches = self.get("num_patches", 0)
+        num_fluids = self.get("num_fluids", 1)
+        bubbles_euler = self.get("bubbles_euler", "F") == "T"
+        bubbles_lagrange = self.get("bubbles_lagrange", "F") == "T"
+
+        # For bubbles_euler with single fluid, alpha is the void fraction
+        # and does not need to sum to 1
+        if bubbles_euler and num_fluids == 1:
+            return
+
+        # For bubbles_lagrange, the Lagrangian phase volume is not
+        # represented in the Eulerian volume fractions
+        if bubbles_lagrange:
+            return
+
+        # IBM cases use alpha as a level-set indicator, not a physical
+        # volume fraction, so the sum-to-1 constraint does not apply
+        num_ibs = self.get("num_ibs", 0) or 0
+        if num_ibs > 0:
+            return
+
+        if not self._is_numeric(num_patches) or num_patches <= 0 or not self._is_numeric(num_fluids):
+            return
+
+        for i in range(1, num_patches + 1):
+            geometry = self.get(f"patch_icpp({i})%geometry")
+            if geometry is None:
+                continue
+
+            # Skip special patches
+            hcid = self.get(f"patch_icpp({i})%hcid")
+            if hcid is not None:
+                continue
+            alter_patches = [self.get(f"patch_icpp({i})%alter_patch({j})") == "T" for j in range(1, num_patches + 1)]
+            if any(alter_patches):
+                continue
+
+            # Collect alpha values, skip if any are analytical expressions
+            alphas = []
+            has_expression = False
+            for j in range(1, num_fluids + 1):
+                alpha = self.get(f"patch_icpp({i})%alpha({j})")
+                if alpha is None:
+                    has_expression = True
+                    break
+                if not self._is_numeric(alpha):
+                    has_expression = True
+                    break
+                alphas.append(alpha)
+
+            if has_expression or len(alphas) != num_fluids:
+                continue
+
+            alpha_sum = sum(alphas)
+            self.warn(abs(alpha_sum - 1.0) > 1e-6, f"patch_icpp({i}): volume fractions sum to {alpha_sum:.8g}, expected 1.0")
+
+    def check_alpha_rho_consistency(self):
+        """Warns about inconsistent alpha/alpha_rho pairs.
+
+        Catches common mistakes:
+        - alpha(j) = 0 but alpha_rho(j) != 0 (density in absent phase)
+        - alpha(j) > 0 but alpha_rho(j) = 0 (present phase has zero density)
+        """
+        num_patches = self.get("num_patches", 0)
+        num_fluids = self.get("num_fluids", 1)
+
+        if not self._is_numeric(num_patches) or num_patches <= 0 or not self._is_numeric(num_fluids):
+            return
+
+        for i in range(1, num_patches + 1):
+            geometry = self.get(f"patch_icpp({i})%geometry")
+            if geometry is None:
+                continue
+
+            # Skip special patches
+            hcid = self.get(f"patch_icpp({i})%hcid")
+            if hcid is not None:
+                continue
+            alter_patches = [self.get(f"patch_icpp({i})%alter_patch({j})") == "T" for j in range(1, num_patches + 1)]
+            if any(alter_patches):
+                continue
+
+            for j in range(1, num_fluids + 1):
+                alpha = self.get(f"patch_icpp({i})%alpha({j})")
+                alpha_rho = self.get(f"patch_icpp({i})%alpha_rho({j})")
+
+                if alpha is None or alpha_rho is None:
+                    continue
+                if not self._is_numeric(alpha) or not self._is_numeric(alpha_rho):
+                    continue
+
+                self.warn(alpha == 0 and alpha_rho != 0, f"patch_icpp({i}): alpha({j}) = 0 but alpha_rho({j}) = {alpha_rho} (density in absent phase)")
+                self.warn(alpha > 1e-10 and alpha_rho == 0, f"patch_icpp({i}): alpha({j}) = {alpha} but alpha_rho({j}) = 0 (present phase has zero density)")
+
+    def check_patch_within_domain(self):
+        """Checks that centroid+length patches are not entirely outside the domain.
+
+        Only applies to geometry types whose bounding box is fully determined
+        by centroid and length (line segments=1, rectangles=3, cuboids=9).
+        Skipped when grid stretching is active because the physical domain
+        extents are transformed and the domain bounds are not directly comparable.
+        """
+        num_patches = self.get("num_patches", 0)
+        if not self._is_numeric(num_patches) or num_patches <= 0:
+            return
+
+        # Skip when any grid stretching is active — domain bounds don't map
+        # directly to physical coordinates in stretched grids
+        if self.get("stretch_x", "F") == "T" or self.get("stretch_y", "F") == "T" or self.get("stretch_z", "F") == "T":
+            return
+
+        x_beg = self.get("x_domain%beg")
+        x_end = self.get("x_domain%end")
+        n = self.get("n", 0)
+        p = self.get("p", 0)
+        y_beg = self.get("y_domain%beg") if self._is_numeric(n) and n > 0 else None
+        y_end = self.get("y_domain%end") if self._is_numeric(n) and n > 0 else None
+        z_beg = self.get("z_domain%beg") if self._is_numeric(p) and p > 0 else None
+        z_end = self.get("z_domain%end") if self._is_numeric(p) and p > 0 else None
+
+        # Pre-check domain bounds are numeric (could be analytical expressions)
+        x_bounds_ok = x_beg is not None and x_end is not None and self._is_numeric(x_beg) and self._is_numeric(x_end)
+        y_bounds_ok = y_beg is not None and y_end is not None and self._is_numeric(y_beg) and self._is_numeric(y_end)
+        z_bounds_ok = z_beg is not None and z_end is not None and self._is_numeric(z_beg) and self._is_numeric(z_end)
+
+        for i in range(1, num_patches + 1):
+            geometry = self.get(f"patch_icpp({i})%geometry")
+            if geometry is None:
+                continue
+
+            # Only check patches whose bounding box is fully determined
+            # by centroid + length (line segments=1, rectangles=3, cuboids=9)
+            if geometry not in [1, 3, 9]:
+                continue
+
+            xc = self.get(f"patch_icpp({i})%x_centroid")
+            lx = self.get(f"patch_icpp({i})%length_x")
+
+            has_x = xc is not None and lx is not None
+            if has_x and x_bounds_ok and self._is_numeric(xc) and self._is_numeric(lx):
+                patch_x_lo = xc - lx / 2.0
+                patch_x_hi = xc + lx / 2.0
+                self.prohibit(patch_x_hi < x_beg or patch_x_lo > x_end, f"patch_icpp({i}): x-extent [{patch_x_lo}, {patch_x_hi}] is entirely outside domain [{x_beg}, {x_end}]")
+
+            if geometry in [3, 9] and y_bounds_ok:
+                yc = self.get(f"patch_icpp({i})%y_centroid")
+                ly = self.get(f"patch_icpp({i})%length_y")
+                if yc is not None and ly is not None and self._is_numeric(yc) and self._is_numeric(ly):
+                    patch_y_lo = yc - ly / 2.0
+                    patch_y_hi = yc + ly / 2.0
+                    self.prohibit(patch_y_hi < y_beg or patch_y_lo > y_end, f"patch_icpp({i}): y-extent [{patch_y_lo}, {patch_y_hi}] is entirely outside domain [{y_beg}, {y_end}]")
+
+            if geometry == 9 and z_bounds_ok:
+                zc = self.get(f"patch_icpp({i})%z_centroid")
+                lz = self.get(f"patch_icpp({i})%length_z")
+                if zc is not None and lz is not None and self._is_numeric(zc) and self._is_numeric(lz):
+                    patch_z_lo = zc - lz / 2.0
+                    patch_z_hi = zc + lz / 2.0
+                    self.prohibit(patch_z_hi < z_beg or patch_z_lo > z_end, f"patch_icpp({i}): z-extent [{patch_z_lo}, {patch_z_hi}] is entirely outside domain [{z_beg}, {z_end}]")
+
+    def check_eos_parameter_sanity(self):
+        """Warns if EOS gamma parameter looks like raw physical gamma.
+
+        MFC uses the transformed parameter Gamma = 1/(gamma-1), not the
+        physical specific heat ratio gamma directly. Common mistake:
+        entering gamma=1.4 (physical) instead of gamma=1/(1.4-1)=2.5.
+
+        - gamma < 0.1 implies physical gamma > 11 (unusual)
+        - gamma > 1000 implies physical gamma ≈ 1.001 (unusual)
+        """
+        num_fluids = self.get("num_fluids")
+        model_eqns = self.get("model_eqns")
+
+        if not self._is_numeric(num_fluids) or model_eqns == 1:
+            return
+
+        for i in range(1, int(num_fluids) + 1):
+            gamma = self.get(f"fluid_pp({i})%gamma")
+            if gamma is None or not self._is_numeric(gamma) or gamma <= 0:
+                continue
+
+            # gamma = 1/(physical_gamma - 1), so physical_gamma = 1/gamma + 1
+            physical_gamma = 1.0 / gamma + 1.0
+
+            self.warn(gamma < 0.1, f"fluid_pp({i})%gamma = {gamma} implies physical gamma = {physical_gamma:.2f} (unusually high). MFC uses the transformed parameter Gamma = 1/(gamma-1)")
+            self.warn(gamma > 1000, f"fluid_pp({i})%gamma = {gamma} implies physical gamma = {physical_gamma:.6f} (very close to 1). Did you enter the physical gamma instead of 1/(gamma-1)?")
+
+    def check_velocity_components(self):
+        """Checks that velocity components are not set in inactive dimensions.
+
+        vel(2) must be zero in 1D (n=0), vel(3) must be zero in 1D/2D (p=0).
+        Exempts MHD simulations where transverse velocity components are
+        physically meaningful even in 1D (they carry transverse momentum
+        coupled to the magnetic field).
+        """
+        n = self.get("n", 0)
+        p = self.get("p", 0)
+        num_patches = self.get("num_patches", 0)
+        mhd = self.get("mhd", "F") == "T"
+
+        if not self._is_numeric(num_patches) or num_patches <= 0:
+            return
+
+        # MHD simulations legitimately use transverse velocities in 1D
+        if mhd:
+            return
+
+        n_is_1d = self._is_numeric(n) and n == 0
+        p_is_2d = self._is_numeric(p) and p == 0
+
+        for i in range(1, num_patches + 1):
+            geometry = self.get(f"patch_icpp({i})%geometry")
+            if geometry is None:
+                continue
+
+            if n_is_1d:
+                vel2 = self.get(f"patch_icpp({i})%vel(2)")
+                if vel2 is not None and self._is_numeric(vel2):
+                    self.prohibit(vel2 != 0, f"patch_icpp({i})%vel(2) = {vel2} but n = 0 (1D simulation)")
+
+            if p_is_2d:
+                vel3 = self.get(f"patch_icpp({i})%vel(3)")
+                if vel3 is not None and self._is_numeric(vel3):
+                    self.prohibit(vel3 != 0, f"patch_icpp({i})%vel(3) = {vel3} but p = 0 (1D/2D simulation)")
+
+    # Build-Flag Compatibility Checks
+
+    def check_build_flags(self):
+        """Checks case parameters against the active build configuration.
+
+        These catch incompatibilities between case settings and how the
+        MFC binaries were compiled (--mpi/--no-mpi, --single, etc.)
+        before any binary is invoked.
+        """
+        parallel_io = self.get("parallel_io", "F") == "T"
+        self.prohibit(parallel_io and not CFG().mpi, "parallel_io = T requires MFC built with --mpi")
+
+    def check_geometry_precision_simulation(self):
+        """Checks that 3D cylindrical geometry is not used with --single builds."""
+        cyl_coord = self.get("cyl_coord", "F") == "T"
+        p = self.get("p", 0)
+        self.prohibit(CFG().single and cyl_coord and p > 0, "Fully 3D cylindrical geometry (cyl_coord = T, p > 0) is not supported in single precision (--single)")
+
+    # Main Validation Entry Points
+
+    def check_ic_extrusion(self):
+        """Checks that files_dir and file_extension are set for extrusion hcids."""
+        extrusion_hcids = {170, 270, 271, 272, 370, 371}
+        num_patches = self.get("num_patches", 0)
+        if not self._is_numeric(num_patches) or num_patches <= 0:
+            return
+
+        for i in range(1, num_patches + 1):
+            hcid = self.get(f"patch_icpp({i})%hcid")
+            if hcid not in extrusion_hcids:
+                continue
+            self.prohibit(
+                not self.is_set("files_dir"),
+                f"patch_icpp({i})%hcid={hcid} requires files_dir to be set",
+            )
+            self.prohibit(
+                not self.is_set("file_extension"),
+                f"patch_icpp({i})%hcid={hcid} requires file_extension to be set",
+            )
+
+    def validate_common(self):
+        """Validate parameters common to all stages"""
+        self.check_parameter_types()  # Type validation first
+        self.check_build_flags()
+        self.check_simulation_domain()
+        self.check_domain_bounds()
+        self.check_model_eqns_and_num_fluids()
+        self.check_igr()
+        self.check_weno()
+        self.check_muscl()
+        self.check_boundary_conditions()
+        self.check_bubbles_euler()
+        self.check_qbmm_and_polydisperse()
+        self.check_adv_n()
+        self.check_hypoelasticity()
+        self.check_phase_change()
+        self.check_ibm()
+        self.check_inflow_ramp()
+        self.check_eos_selector()
+        self.check_stiffened_eos()
+        self.check_eos_parameter_sanity()
+        self.check_surface_tension()
+        self.check_mhd()
+        self.check_chemistry()
+        self.check_reactive_burn()
+
+    def validate_simulation(self):
+        """Validate simulation-specific parameters"""
+        self.validate_common()
+        self.check_geometry_precision_simulation()
+        self.check_finite_difference()
+        self.check_time_stepping()
+        self.check_riemann_solver()
+        self.check_weno_simulation()
+        self.check_muscl_simulation()
+        self.check_interface_compression()
+        self.check_model_eqns_simulation()
+        self.check_bubbles_euler_simulation()
+        self.check_body_forces()
+        self.check_synthetic_turbulence()
+        self.check_viscosity()
+        self.check_non_newtonian()
+        self.check_mhd_simulation()
+        self.check_igr_simulation()
+        self.check_acoustic_source()
+        self.check_adaptive_time_stepping()
+        self.check_alt_soundspeed()
+        self.check_bubbles_lagrange()
+        self.check_continuum_damage()
+        self.check_grcbc()
+        self.check_probe_output()
+
+    def validate_pre_process(self):
+        """Validate pre-process-specific parameters"""
+        self.validate_common()
+        self.check_restart()
+        self.check_domain_extents()
+        self.check_qbmm_pre_process()
+        self.check_parallel_io_pre_process()
+        self.check_grid_stretching()
+        self.check_perturb_density()
+        self.check_misc_pre_process()
+        self.check_patch_physics()
+        self.check_volume_fraction_sum()
+        self.check_alpha_rho_consistency()
+        self.check_patch_within_domain()
+        self.check_velocity_components()
+        self.check_bc_patches()
+        self.check_ic_extrusion()
+
+    def validate_post_process(self):
+        """Validate post-process-specific parameters"""
+        self.validate_common()
+        self.check_finite_difference()
+        self.check_time_stepping()
+        self.check_output_format()
+        self.check_partial_domain()
+        self.check_partial_density()
+        self.check_momentum_post()
+        self.check_velocity_post()
+        self.check_flux_limiter()
+        self.check_volume_fraction()
+        self.check_vorticity()
+        self.check_fft()
+        self.check_qm()
+        self.check_liutex_post()
+        self.check_schlieren()
+        self.check_surface_tension_post()
+        self.check_no_flow_variables()
+
+    def validate(self, stage: str = "simulation"):
+        """Main validation method
+
+        Args:
+            stage: One of 'simulation', 'pre_process', or 'post_process'
+                   Other stages (like 'syscheck') have no case constraints and are skipped
+
+        Raises:
+            CaseConstraintError: If any constraint violations are found
+        """
+        self.errors = []
+        self.warnings = []
+
+        if stage == "simulation":
+            self.validate_simulation()
+        elif stage == "pre_process":
+            self.validate_pre_process()
+        elif stage == "post_process":
+            self.validate_post_process()
+        else:
+            # No stage-specific constraints for auxiliary targets like 'syscheck'.
+            # Silently skip validation rather than treating this as an error.
+            return []
+
+        if self.errors:
+            error_msg = self._format_errors()
+            raise CaseConstraintError(error_msg)
+
+        return self.warnings
+
+    def _format_errors(self) -> str:
+        """Format errors with enhanced context and suggestions."""
+        lines = ["[bold red]Case parameter constraint violations:[/bold red]\n"]
+
+        for i, err in enumerate(self.errors, 1):
+            lines.append(f"  [bold]{i}.[/bold] {err}")
+
+            # Add helpful hints for common errors
+            err_lower = err.lower()
+            if "must be positive" in err_lower or "must be set" in err_lower:
+                lines.append("     [dim]Check that this required parameter is defined in your case file[/dim]")
+                continue
+            if "boundary" in err_lower or "bc_" in err_lower:
+                lines.append("     [dim]Common BC values: -1 (periodic), -2 (reflective), -3 (extrapolation)[/dim]")
+                continue
+
+            # Auto-generate hints from CONSTRAINTS with value_labels
+            for param_name, constraint in CONSTRAINTS.items():
+                if not re.search(r"\b" + re.escape(param_name.lower()) + r"\b", err_lower):
+                    continue
+                choices = constraint.get("choices")
+                if not choices:
+                    continue
+                labels = constraint.get("value_labels", {})
+                if labels:
+                    items = [f"{v} ({labels[v]})" if v in labels else str(v) for v in choices]
+                    hint = f"Valid values: {', '.join(items)}"
+                else:
+                    hint = f"Valid values: {choices}"
+                lines.append(f"     [dim]{hint}[/dim]")
+                break
+
+        lines.append("")
+        lines.append("[dim]Tip: Run './mfc.sh validate case.py' for detailed validation[/dim]")
+
+        return "\n".join(lines)
+
+
+def validate_case_constraints(params: Dict[str, Any], stage: str = "simulation") -> List[str]:
+    """Convenience function to validate case parameters
+
+    Args:
+        params: Dictionary of case parameters
+        stage: One of 'simulation', 'pre_process', or 'post_process'
+
+    Returns:
+        List of warning messages (non-fatal issues)
+
+    Raises:
+        CaseConstraintError: If any constraint violations are found
+    """
+    validator = CaseValidator(params)
+    return validator.validate(stage) or []

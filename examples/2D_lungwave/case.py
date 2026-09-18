@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import math
 import json
+import math
 
 pi = 3.141592653589
 # material parameters
@@ -102,12 +102,12 @@ print(
             "t_step_save": tsave,
             # Simulation Algorithm Parameters
             "num_patches": 2,
-            "model_eqns": 2,
+            "model_eqns": "5eq",
             "alt_soundspeed": "F",
             "num_fluids": 2,
             "mpp_lim": "T",
             "mixture_err": "T",
-            "time_stepper": 3,
+            "time_stepper": "rk3",
             "weno_order": 5,
             "weno_eps": 1.0e-16,
             "weno_Re_flux": "F",
@@ -115,16 +115,16 @@ print(
             "mapped_weno": "T",
             "null_weights": "F",
             "mp_weno": "T",
-            "riemann_solver": 2,
-            "wave_speeds": 1,
-            "avg_state": 2,
+            "riemann_solver": "hllc",
+            "wave_speeds": "direct",
+            "avg_state": "arithmetic",
             "bc_x%beg": -1,
             "bc_x%end": -1,
             "bc_y%beg": -6,
             "bc_y%end": -6,
             # Formatted Database Files Structure Parameters
-            "format": 1,
-            "precision": 2,
+            "format": "silo",
+            "precision": "double",
             "prim_vars_wrt": "T",
             "parallel_io": "T",
             # Monopole setting
@@ -153,7 +153,7 @@ print(
             "patch_icpp(1)%alpha(1)": alphal_back,
             "patch_icpp(1)%alpha(2)": alphag_back,
             # Patch 2: Lung
-            "patch_icpp(2)%geometry": 7,
+            "patch_icpp(2)%geometry": 3,
             "patch_icpp(2)%hcid": 205,
             "patch_icpp(2)%alter_patch(1)": "T",
             "patch_icpp(2)%x_centroid": dlengx / 2.0,
@@ -170,8 +170,10 @@ print(
             "patch_icpp(2)%alpha(2)": alphag_lung,
             # Fluids Physical Parameters
             "fluid_pp(1)%gamma": 1.0e00 / (gammal - 1.0e00),
+            "fluid_pp(1)%eos": "stiffened_gas",
             "fluid_pp(1)%pi_inf": gammal * Bl_n / (gammal - 1.0e00),
             "fluid_pp(2)%gamma": 1.0e00 / (gammag - 1.0e00),
+            "fluid_pp(2)%eos": "stiffened_gas",
             "fluid_pp(2)%pi_inf": gammag * Bg_n / (gammag - 1.0e00),
         }
     )

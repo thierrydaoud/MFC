@@ -14,7 +14,7 @@
 % if account:
 #SBATCH --account="${account}"
 % endif
-% if gpu:
+% if gpu_enabled:
 #SBATCH --gpus-per-node=${tasks_per_node}
 #SBATCH --mem=208G
 #SBATCH --gpu-bind=closest
@@ -32,7 +32,7 @@ ${helpers.template_prologue()}
 
 ok ":) Loading modules:\n"
 cd "${MFC_ROOT_DIR}"
-. ./mfc.sh load -c dai -m ${'g' if gpu else 'c'}
+. ./mfc.sh load -c dai -m ${'g' if gpu_enabled else 'c'}
 cd - > /dev/null
 echo
 
@@ -44,7 +44,7 @@ echo
         (set -x; ${profiler} "${target.get_install_binpath(case)}")
     % else:
         (set -x; ${profiler}                                   \
-            mpirun -np ${nodes*tasks_per_node}                 \
+            srun --ntasks ${nodes*tasks_per_node}                 \
                    "${target.get_install_binpath(case)}")
     % endif
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-import math
 import json
+import math
+import os
+import random
 
 # Bubble screen
 # Description: A planar acoustic wave interacts with a bubble cloud
@@ -26,8 +28,8 @@ T_host = 298  # temperature K
 R_uni = 8314  # Universal gas constant - J/kmol/K
 MW_g = 28.0  # Molar weight of the gas - kg/kmol
 MW_v = 18.0  # Molar weight of the vapor - kg/kmol
-gamma_g = 1.4  # Specific heat ratio of the gas
-gamma_v = 1.333  # Specific heat ratio of the vapor
+gam_g = 1.4  # Specific heat ratio of the gas
+gam_v = 1.333  # Specific heat ratio of the vapor
 pv = 2350  # Vapor pressure of the host - Pa
 cp_g = 1.0e3  # Specific heat of the gas - J/kg/K
 cp_v = 2.1e3  # Specific heat of the vapor - J/kg/K
@@ -58,6 +60,53 @@ Nz = 50  # number of elements into z direction
 
 dt = 7.5e-9  # constant time-step - sec
 
+
+def generate_bubble_cloud():
+    """Generate monodisperse bubble cloud with 10 μm radius"""
+    # Bubble properties
+    void_fraction = 4e-5
+    bubble_radius = 10e-6  # 10 μm in meters
+
+    # Domain: 5mm x 5mm x 5mm cube centered at origin
+    box_size = 5.0e-3  # 5 mm in meters
+
+    # Convert to nondimensional units
+    bubble_radius_nd = bubble_radius / x0  # in units of x0
+    box_size_nd = box_size / x0
+
+    # Set random seed for reproducibility
+    random.seed(42)
+
+    # Calculate box volume
+    box_volume = box_size_nd**3
+
+    # Calculate number of bubbles for target void fraction
+    bubble_volume = (4.0 / 3.0) * math.pi * bubble_radius_nd**3
+    n_bubbles = int(void_fraction * box_volume / bubble_volume)
+
+    # Generate random positions in the cube
+    box_half = box_size_nd / 2.0
+    positions = [(random.uniform(-box_half, box_half), random.uniform(-box_half, box_half), random.uniform(-box_half, box_half)) for _ in range(n_bubbles)]
+
+    # Create output directory if needed
+    input_dir = os.path.join(os.path.dirname(__file__), "input")
+    os.makedirs(input_dir, exist_ok=True)
+
+    # Write bubble file
+    bubble_file = os.path.join(input_dir, "lag_bubbles.dat")
+    with open(bubble_file, "w") as f:
+        for i in range(n_bubbles):
+            # Format: x y z vx vy vz radius interface_velocity
+            # All velocities are zero at initialization
+            x, y, z = positions[i]
+            f.write(f"{x:.6e}\t{y:.6e}\t{z:.6e}\t0.0\t0.0\t0.0\t{bubble_radius_nd:.6e}\t0.0\n")
+
+    return n_bubbles
+
+
+# Generate bubble cloud
+nBubs = generate_bubble_cloud()
+
 # Configuring case dictionary
 print(
     json.dumps(
@@ -80,10 +129,10 @@ print(
             "dt": dt * (c0 / x0),
             "t_step_start": 0,
             "t_step_stop": 3000,
-            "t_step_save": 500,
+            "t_step_save": 30,
             # Simulation Algorithm Parameters
-            "model_eqns": 2,
-            "time_stepper": 3,
+            "model_eqns": "5eq",
+            "time_stepper": "rk3",
             "num_fluids": 2,
             "num_patches": 1,
             "viscous": "T",
@@ -91,9 +140,9 @@ print(
             "weno_order": 5,
             "weno_eps": 1.0e-16,
             "mapped_weno": "T",
-            "riemann_solver": 2,
-            "wave_speeds": 1,
-            "avg_state": 2,
+            "riemann_solver": "hllc",
+            "wave_speeds": "direct",
+            "avg_state": "arithmetic",
             "bc_x%beg": -6,
             "bc_x%end": -6,
             "bc_y%beg": -1,
@@ -116,10 +165,11 @@ print(
             "acoustic(1)%dir": 0.0,
             "acoustic(1)%delay": 0.0,
             # Formatted Database Files Structure Parameters
-            "format": 1,
-            "precision": 2,
+            "format": "silo",
+            "precision": "double",
             "prim_vars_wrt": "T",
             "parallel_io": "T",
+            "lag_db_wrt": "T",
             # Patch 1: Water (left)
             "patch_icpp(1)%geometry": 9,
             "patch_icpp(1)%x_centroid": 0.0,
@@ -138,8 +188,10 @@ print(
             "patch_icpp(1)%alpha(2)": 0.0,
             # Lagrangian Bubbles
             "bubbles_lagrange": "T",
-            "bubble_model": 2,  # Keller-Miksis model
-            "lag_params%nBubs_glb": 1194,  # Number of bubbles
+            "bubble_model": "keller_miksis",  # Keller-Miksis model
+            "thermal": 3,
+            "polytropic": "F",
+            "lag_params%nBubs_glb": nBubs,  # Number of bubbles
             "lag_params%solver_approach": 2,
             "lag_params%cluster_type": 2,
             "lag_params%pressure_corrector": "T",
@@ -150,32 +202,36 @@ print(
             "lag_params%valmaxvoid": 0.9,
             "lag_params%write_bubbles": "F",
             "lag_params%write_bubbles_stats": "F",
-            "lag_params%c0": c0,
-            "lag_params%rho0": rho0,
-            "lag_params%T0": T0,
-            "lag_params%x0": x0,
-            "lag_params%diffcoefvap": diffVapor,
-            "lag_params%Thost": T_host,
+            # Bubble parameters
+            "bub_pp%R0ref": 1.0,
+            "bub_pp%p0ref": 1.0,
+            "bub_pp%rho0ref": 1.0,
+            "bub_pp%T0ref": 1.0,
+            "bub_pp%ss": sigBubble / (rho0 * x0 * c0 * c0),
+            "bub_pp%pv": pv / p0,
+            "bub_pp%vd": diffVapor / (x0 * c0),
+            "bub_pp%mu_l": mu_host / (rho0 * x0 * c0),
+            "bub_pp%gam_v": gam_v,
+            "bub_pp%gam_g": gam_g,
+            "bub_pp%M_v": MW_v,
+            "bub_pp%M_g": MW_g,
+            "bub_pp%k_v": k_v * (T0 / (x0 * rho0 * c0 * c0 * c0)),
+            "bub_pp%k_g": k_g * (T0 / (x0 * rho0 * c0 * c0 * c0)),
+            "bub_pp%cp_v": cp_v * (T0 / (c0 * c0)),
+            "bub_pp%cp_g": cp_g * (T0 / (c0 * c0)),
+            "bub_pp%R_v": (R_uni / MW_v) * (T0 / (c0 * c0)),
+            "bub_pp%R_g": (R_uni / MW_g) * (T0 / (c0 * c0)),
             # Fluids Physical Parameters
             # Host medium
             "fluid_pp(1)%gamma": 1.0 / (gamma_host - 1.0),
+            "fluid_pp(1)%eos": "stiffened_gas",
             "fluid_pp(1)%pi_inf": gamma_host * (pi_inf_host / p0) / (gamma_host - 1.0),
             "fluid_pp(1)%Re(1)": 1.0 / (mu_host / (rho0 * c0 * x0)),
-            "fluid_pp(1)%mul0": mu_host,
-            "fluid_pp(1)%ss": sigBubble,
-            "fluid_pp(1)%pv": pv,
-            "fluid_pp(1)%gamma_v": gamma_v,
-            "fluid_pp(1)%M_v": MW_v,
-            "fluid_pp(1)%k_v": k_v,
-            "fluid_pp(1)%cp_v": cp_v,
             # Bubble gas state
-            "fluid_pp(2)%gamma": 1.0 / (gamma_g - 1.0),
-            "fluid_pp(2)%pi_inf": 0.0e00,
+            "fluid_pp(2)%gamma": 1.0 / (gam_g - 1.0),
+            "fluid_pp(2)%eos": "ideal_gas",
             "fluid_pp(2)%Re(1)": 1.0 / (mu_g / (rho0 * c0 * x0)),
-            "fluid_pp(2)%gamma_v": gamma_g,
-            "fluid_pp(2)%M_v": MW_g,
-            "fluid_pp(2)%k_v": k_g,
-            "fluid_pp(2)%cp_v": cp_g,
-        }
+        },
+        indent=4,
     )
 )

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import math
 import json
+import math
 
 # Numerical setup
 Nx = 399
@@ -27,12 +27,12 @@ print(
             "t_step_save": int(math.ceil(Nt / 10.0)),
             # Simulation Algorithm Parameters
             "num_patches": 2,
-            "model_eqns": 2,
+            "model_eqns": "5eq",
             "alt_soundspeed": "F",
             "num_fluids": 1,
             "mpp_lim": "F",
             "mixture_err": "F",
-            "time_stepper": 3,
+            "time_stepper": "rk3",
             "weno_order": 5,
             "weno_eps": 1.0e-16,
             "weno_Re_flux": "F",
@@ -40,14 +40,14 @@ print(
             "mapped_weno": "T",
             "null_weights": "F",
             "mp_weno": "F",
-            "riemann_solver": 2,
-            "wave_speeds": 1,
-            "avg_state": 2,
+            "riemann_solver": "hllc",
+            "wave_speeds": "direct",
+            "avg_state": "arithmetic",
             "bc_x%beg": -3,
             "bc_x%end": -3,
             # Formatted Database Files Structure Parameters
-            "format": 1,
-            "precision": 2,
+            "format": "silo",
+            "precision": "double",
             "prim_vars_wrt": "T",
             "parallel_io": "T",
             # Patch 1 L
@@ -67,8 +67,9 @@ print(
             "patch_icpp(2)%alpha_rho(1)": 0.125e00,
             "patch_icpp(2)%alpha(1)": 1.0,
             # Fluids Physical Parameters
+            # air: an ideal gas, so it carries no stiffness and pi_inf is not read
+            "fluid_pp(1)%eos": "ideal_gas",
             "fluid_pp(1)%gamma": 1.0e00 / (1.4 - 1.0e00),
-            "fluid_pp(1)%pi_inf": 0.0,
         }
     )
 )

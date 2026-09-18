@@ -1,6 +1,14 @@
 name: Spell Check
 
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# Least-privilege default: no job in this workflow writes to the repo.
+permissions:
+  contents: read
 
 jobs:
   run:
@@ -8,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
       
     - name: MFC Python Setup
       run:  ./mfc.sh init

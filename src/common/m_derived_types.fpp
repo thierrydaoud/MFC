@@ -1,15 +1,13 @@
 !>
-!! @file m_derived_types.f90
+!! @file
 !! @brief Contains module m_derived_types
 
 #:include "macros.fpp"
 
-!> @brief This file contains the definitions of all of the custom-defined
-!!              types used in the pre-process code.
+!> @brief Shared derived types for field data, patch geometry, bubble dynamics, and MPI I/O structures
 module m_derived_types
 
-    use m_constants  !< Constants
-
+    use m_constants
     use m_precision_select
     use m_thermochem, only: num_species
 
@@ -17,76 +15,212 @@ module m_derived_types
 
     !> Derived type adding the field position (fp) as an attribute
     type field_position
-        real(wp), allocatable, dimension(:, :, :) :: fp !< Field position
+        real(stp), allocatable, dimension(:,:,:) :: fp  !< Field position
     end type field_position
 
     !> Derived type annexing a scalar field (SF)
     type scalar_field
-        real(wp), pointer, dimension(:, :, :) :: sf => null()
+        real(stp), pointer, dimension(:,:,:) :: sf => null()
     end type scalar_field
 
     !> Derived type for bubble variables pb and mv at quadrature nodes (qbmm)
     type pres_field
-        real(wp), pointer, dimension(:, :, :, :, :) :: sf => null()
+        real(stp), pointer, dimension(:,:,:,:,:) :: sf => null()
     end type pres_field
 
     !> Derived type annexing an integer scalar field (SF)
     type integer_field
-        integer, pointer, dimension(:, :, :) :: sf => null()
+#ifdef MFC_MIXED_PRECISION
+        integer(kind=1), pointer, dimension(:,:,:) :: sf => null()
+#else
+        integer, pointer, dimension(:,:,:) :: sf => null()
+#endif
     end type integer_field
 
     !> Derived type for levelset
     type levelset_field
-        real(wp), pointer, dimension(:, :, :, :) :: sf => null()
+        real(stp), pointer, dimension(:,:,:,:) :: sf => null()
     end type levelset_field
 
     !> Derived type for levelset norm
     type levelset_norm_field
-        real(wp), pointer, dimension(:, :, :, :, :) :: sf => null()
+        real(stp), pointer, dimension(:,:,:,:,:) :: sf => null()
     end type levelset_norm_field
 
     type mpi_io_var
-        integer, allocatable, dimension(:) :: view
+        integer, allocatable, dimension(:)            :: view
         type(scalar_field), allocatable, dimension(:) :: var
     end type mpi_io_var
 
     type mpi_io_ib_var
-        integer :: view
+        integer             :: view
         type(integer_field) :: var
     end type mpi_io_ib_var
 
     type mpi_io_levelset_var
-        integer :: view
+        integer              :: view
         type(levelset_field) :: var
     end type mpi_io_levelset_var
 
     type mpi_io_levelset_norm_var
-        integer :: view
+        integer                   :: view
         type(levelset_norm_field) :: var
     end type mpi_io_levelset_norm_var
 
     !> Derived type annexing a vector field (VF)
     type vector_field
-        type(scalar_field), allocatable, dimension(:) :: vf !< Vector field
+        type(scalar_field), allocatable, dimension(:) :: vf  !< Vector field
     end type vector_field
+
+    !> Generic 3-component vector (e.g., spatial coordinates or field components) Named _dt (derived types: x,y,z) to differentiate
+    !! from t_vec3 (3-component vector)
+    type vec3_dt  ! dt for derived types
+        real(wp) :: x
+        real(wp) :: y
+        real(wp) :: z
+    end type vec3_dt
+
+    !> Left and right Riemann states
+    type riemann_states
+        real(wp) :: L
+        real(wp) :: R
+    end type riemann_states
+
+    !> Left and right Riemann states for 3-component vectors
+    type riemann_states_vec3
+        real(wp) :: L(3)
+        real(wp) :: R(3)
+    end type riemann_states_vec3
+
+    !> Lightweight beg/end pair for equation index ranges (no BC payload).
+    type idx_bounds_info
+        integer :: beg
+        integer :: end
+    end type idx_bounds_info
 
     !> Integer bounds for variables
     type int_bounds_info
-        integer :: beg
-        integer :: end
-
-        real(wp) :: vb1
-        real(wp) :: vb2
-        real(wp) :: vb3
-        real(wp) :: ve1
-        real(wp) :: ve2
-        real(wp) :: ve3
-        real(wp) :: pres_in, pres_out
-        real(wp), dimension(3) :: vel_in, vel_out
+        integer                             :: beg
+        integer                             :: end
+        real(wp)                            :: vb1
+        real(wp)                            :: vb2
+        real(wp)                            :: vb3
+        real(wp)                            :: ve1
+        real(wp)                            :: ve2
+        real(wp)                            :: ve3
+        real(wp)                            :: pres_in, pres_out
+        real(wp), dimension(3)              :: vel_in, vel_out
         real(wp), dimension(num_fluids_max) :: alpha_rho_in, alpha_in
-        logical :: grcbc_in, grcbc_out, grcbc_vel_out
-
+        logical                             :: grcbc_in, grcbc_out, grcbc_vel_out
+        !> Smooth start-up of a GRCBC inflow: the inflow velocity is scaled by f(t) = vel_in_frac0 + (1 - vel_in_frac0) (1 + tanh(6
+        !! (t - t0)/tau - 3))/2, so it leaves vel_in_frac0 of its final value at t0 and reaches it after vel_in_ramp. Inactive when
+        !! the ramp duration is zero.
+        real(wp) :: vel_in_ramp, vel_in_t0, vel_in_frac0
+        logical  :: isothermal_in, isothermal_out
+        real(wp) :: Twall_in, Twall_out
     end type int_bounds_info
+
+    !> Groups the x, y, z boundary condition begin/end codes for passing as a single argument.
+    type bc_xyz_info
+        type(int_bounds_info) :: x, y, z
+    end type bc_xyz_info
+
+    !> QBMM moment index mappings - separate from bub beg/end so eqn_idx contains no allocatables.
+    type qbmm_idx_info
+        integer, dimension(:), allocatable     :: rs       !< R moment indices per bubble bin
+        integer, dimension(:), allocatable     :: vs       !< V moment indices per bubble bin
+        integer, dimension(:), allocatable     :: ps       !< Pressure moment indices per bubble bin
+        integer, dimension(:), allocatable     :: ms       !< Mass moment indices per bubble bin
+        integer, dimension(:,:), allocatable   :: moms     !< Moment indices for qbmm
+        integer, dimension(:,:,:), allocatable :: fullmom  !< Full moment indices for qbmm
+    end type qbmm_idx_info
+
+    !> All conserved-variable equation indices, computed at startup from model_eqns and enabled features.
+    !> Range indices (beg/end) use int_bounds_info; scalar indices are plain integers (0 = inactive).
+    !> Contains no allocatable members - safe for GPU_DECLARE as a single struct.
+    type eqn_idx_info
+        type(idx_bounds_info) :: cont     !< Partial densities (continuity equations)
+        type(idx_bounds_info) :: mom      !< Momentum components
+        type(idx_bounds_info) :: adv      !< Volume fractions (advection equations)
+        type(idx_bounds_info) :: bub      !< Bubble equation range (beg/end only)
+        type(idx_bounds_info) :: stress   !< Stress tensor components
+        type(idx_bounds_info) :: B        !< Magnetic field components
+        type(idx_bounds_info) :: int_en   !< Internal energy equations
+        type(idx_bounds_info) :: species  !< Chemistry species equations
+        integer               :: E        !< Energy/pressure equation
+        integer               :: n        !< Number density equation
+        integer               :: alf      !< Void fraction (scalar, model_eqns=4)
+        integer               :: gamma    !< Specific heat ratio function (model_eqns=1)
+        integer               :: pi_inf   !< Liquid stiffness function (model_eqns=1)
+        integer               :: c        !< Color function equation
+        integer               :: damage   !< Damage variable equation
+        integer               :: psi      !< Psi variable equation
+    end type eqn_idx_info
+
+    !> Initial-condition state assembled by pre_process: working primitive and
+    !> conservative fields, temperature, boundary-condition types, and the
+    !> patch-identity bookkeeping array.
+    type ic_context
+        type(scalar_field), allocatable, dimension(:)    :: q_prim_vf  !< Primitive variables
+        type(scalar_field), allocatable, dimension(:)    :: q_cons_vf  !< Conservative variables
+        type(scalar_field)                               :: q_T_sf     !< Temperature field
+        type(integer_field), allocatable, dimension(:,:) :: bc_type    !< Boundary-condition type fields
+#ifdef MFC_MIXED_PRECISION
+        integer(kind=1), allocatable, dimension(:,:,:) :: patch_id_fp  !< Patch identities bookkeeping
+#else
+        integer, allocatable, dimension(:,:,:) :: patch_id_fp  !< Patch identities bookkeeping
+#endif
+    end type ic_context
+
+    !> Finite-difference state for post_process: density gradient magnitude for
+    !> numerical Schlieren and centered FD coefficients in x-, y-, and z-directions.
+    type fd_context
+        real(wp), allocatable, dimension(:,:,:) :: gm_rho_sf   !< Density gradient magnitude for numerical Schlieren
+        real(wp), allocatable, dimension(:,:)   :: fd_coeff_x  !< FD coefficients in the x-direction
+        real(wp), allocatable, dimension(:,:)   :: fd_coeff_y  !< FD coefficients in the y-direction
+        real(wp), allocatable, dimension(:,:)   :: fd_coeff_z  !< FD coefficients in the z-direction
+    end type fd_context
+
+    !> Output workspace for post_process: flow variable buffers, VisIt extents/offsets,
+    !> directory paths, Silo/Binary file handles, and variable count.
+    type output_context
+        ! Flow variable storage; q_root_sf gathers to rank 0 in 1D parallel runs
+        real(wp), allocatable, dimension(:,:,:) :: q_sf       !< Working flow variable field (public)
+        real(wp), allocatable, dimension(:,:,:) :: q_root_sf  !< Gathered 1D flow variable field (rank 0 only)
+        real(wp), allocatable, dimension(:,:,:) :: cyl_q_sf   !< Cylindrical-geometry reordered field
+        ! Single precision storage for flow variables
+        real(sp), allocatable, dimension(:,:,:) :: q_sf_s       !< Single-precision working field (public)
+        real(sp), allocatable, dimension(:,:,:) :: q_root_sf_s  !< Single-precision gathered 1D field
+        real(sp), allocatable, dimension(:,:,:) :: cyl_q_sf_s   !< Single-precision cylindrical reordered field
+        ! Spatial and data extents for VisIt visualization (Silo only)
+        real(wp), allocatable, dimension(:,:) :: spatial_extents  !< Spatial extents per process
+        real(wp), allocatable, dimension(:,:) :: data_extents     !< Data extents per process
+        ! Ghost zone layer sizes (lo/hi) for subdomain connectivity in VisIt (Silo only)
+        integer, allocatable, dimension(:) :: lo_offset  !< Ghost zone lo sizes per active direction
+        integer, allocatable, dimension(:) :: hi_offset  !< Ghost zone hi sizes per active direction
+        ! Cell-boundary count per active coordinate direction (Silo only)
+        integer, allocatable, dimension(:) :: dims  !< Cell-boundary counts per active direction
+        ! Formatted database directory paths
+        character(LEN=path_len + name_len)   :: dbdir          !< Base database directory
+        character(LEN=path_len + 2*name_len) :: proc_rank_dir  !< Per-rank subdirectory
+        character(LEN=path_len + 2*name_len) :: rootdir        !< Root subdirectory
+        ! Formatted database file handles
+        integer :: dbroot   !< Master/root file handle
+        integer :: dbfile   !< Slave/local file handle
+        integer :: optlist  !< Silo options list handle (per-call scratch)
+        ! Variable count for Binary format
+        integer :: dbvars  !< Total flow variables to write
+    end type output_context
+
+    type bc_patch_parameters
+        integer                :: geometry
+        integer                :: type
+        integer                :: dir
+        integer                :: loc
+        real(wp), dimension(3) :: centroid
+        real(wp), dimension(3) :: length
+        real(wp)               :: radius
+    end type bc_patch_parameters
 
     !> Derived type adding beginning (beg) and end bounds info as attributes
     type bounds_info
@@ -94,327 +228,395 @@ module m_derived_types
         real(wp) :: end
     end type bounds_info
 
-    !> bounds for the bubble dynamic variables
-    type bub_bounds_info
-        integer :: beg
-        integer :: end
-        integer, dimension(:), allocatable :: rs
-        integer, dimension(:), allocatable :: vs
-        integer, dimension(:), allocatable :: ps
-        integer, dimension(:), allocatable :: ms
-        integer, dimension(:, :), allocatable :: moms !< Moment indices for qbmm
-        integer, dimension(:, :, :), allocatable :: fullmom !< Moment indices for qbmm
-    end type bub_bounds_info
-
     !> Defines parameters for a Model Patch
     type ic_model_parameters
-        character(LEN=pathlen_max) :: filepath !<
-        !! Path the STL file relative to case_dir.
-
-        t_vec3 :: translate !<
-        !! Translation of the STL object.
-
-        t_vec3 :: scale !<
-        !! Scale factor for the STL object.
-
-        t_vec3 :: rotate !<
-        !! Angle to rotate the STL object along each cartesian coordinate axis,
-        !! in radians.
-
-        integer :: spc !<
-        !! Number of samples per cell to use when discretizing the STL object.
-
-        real(wp) :: threshold !<
-        !! Threshold to turn on smoothen STL patch.
+        character(LEN=pathlen_max) :: filepath   !< Path the STL file relative to case_dir.
+        real(wp), dimension(1:3)   :: translate  !< Translation of the STL object.
+        real(wp), dimension(1:3)   :: scale      !< Scale factor for the STL object.
+        real(wp), dimension(1:3)   :: rotate     !< Angle to rotate the STL object along each cartesian coordinate axis, in radians.
+        integer                    :: spc        !< Number of samples per cell to use when discretizing the STL object.
+        real(wp)                   :: threshold  !< Threshold to turn on smoothen STL patch.
     end type ic_model_parameters
 
     type :: t_triangle
-        real(wp), dimension(1:3, 1:3) :: v ! Vertices of the triangle
-        t_vec3 :: n ! Normal vector
+        real(wp), dimension(1:3,1:3) :: v  !< Vertices of the triangle
+        real(wp), dimension(1:3)     :: n  !< Normal vector
     end type t_triangle
 
-    type :: t_ray
-        t_vec3 :: o ! Origin
-        t_vec3 :: d ! Direction
-    end type t_ray
-
     type :: t_bbox
-        t_vec3 :: min ! Minimum coordinates
-        t_vec3 :: max ! Maximum coordinates
+        real(wp), dimension(1:3) :: min  !< Minimum coordinates
+        real(wp), dimension(1:3) :: max  !< Maximum coordinates
     end type t_bbox
 
     type :: t_model
-        integer :: ntrs   ! Number of triangles
-        type(t_triangle), allocatable :: trs(:) ! Triangles
+        integer                       :: ntrs    !< Number of triangles
+        type(t_triangle), allocatable :: trs(:)  !< Triangles
     end type t_model
 
-    !> Derived type adding initial condition (ic) patch parameters as attributes
-    !! NOTE: The requirements for the specification of the above parameters
-    !! are strongly dependent on both the choice of the multicomponent flow
-    !! model as well as the choice of the patch geometry.
+    type :: t_model_array
+        ! Original CPU-side fields (unchanged)
+        type(t_model), allocatable              :: model                !< STL/OBJ geometry model
+        real(wp), allocatable, dimension(:,:,:) :: boundary_v           !< Boundary vertices
+        integer                                 :: boundary_edge_count  !< Number of boundary edges
+
+        ! GPU-friendly flattened arrays
+        integer                                 :: ntrs   !< Copy of model%ntrs
+        real(wp), allocatable, dimension(:,:,:) :: trs_v  !< Triangle vertices (3, 3, ntrs)
+        real(wp), allocatable, dimension(:,:)   :: trs_n  !< Triangle normals (3, ntrs)
+    end type t_model_array
+
+    !> Derived type adding initial condition (ic) patch parameters as attributes NOTE: The requirements for the specification of the
+    !! above parameters are strongly dependent on both the choice of the multicomponent flow model as well as the choice of the
+    !! patch geometry.
     type ic_patch_parameters
 
-        integer :: geometry !< Type of geometry for the patch
-
-        real(wp) :: x_centroid, y_centroid, z_centroid !<
-        !! Location of the geometric center, i.e. the centroid, of the patch. It
-        !! is specified through its x-, y- and z-coordinates, respectively.
-
-        real(wp) :: length_x, length_y, length_z !< Dimensions of the patch. x,y,z Lengths.
-        real(wp) :: radius !< Dimensions of the patch. radius.
-
-        real(wp), dimension(3) :: radii !<
-        !! Vector indicating the various radii for the elliptical and ellipsoidal
-        !! patch geometries. It is specified through its x-, y-, and z-components
-        !! respectively.
-
-        real(wp) :: epsilon, beta !<
-        !! The isentropic vortex parameters for the amplitude of the disturbance and
-        !! domain of influence.
-
-        real(wp), dimension(2:9) :: a !<
-        !! The parameters needed for the spherical harmonic patch
-
+        integer :: geometry  !< Type of geometry for the patch
+        real(wp) :: x_centroid, y_centroid, z_centroid  !< Geometric center coordinates of the patch
+        real(wp) :: length_x, length_y, length_z  !< Dimensions of the patch. x,y,z Lengths.
+        real(wp) :: radius  !< Dimensions of the patch. radius.
+        real(wp), dimension(3) :: radii  !< Elliptical/ellipsoidal patch radii in x, y, z
+        real(wp) :: epsilon, beta  !< The isentropic vortex parameters for the amplitude of the disturbance and domain of influence.
+        real(wp), dimension(2:9) :: a  !< Used by hardcoded IC and as temporary variables.
         logical :: non_axis_sym
 
-        real(wp), dimension(3) :: normal !<
-        !! Normal vector indicating the orientation of the patch. It is specified
-        !! through its x-, y- and z-components, respectively.
-
-        logical, dimension(0:num_patches_max - 1) :: alter_patch !<
-
-        !! List of permissions that indicate to the current patch which preceding
-        !! patches it is allowed to overwrite when it is in process of being laid
-        !! out in the domain
-
-        logical :: smoothen !<
-        !! Permission indicating to the current patch whether its boundaries will
-        !! be smoothed out across a few cells or whether they are to remain sharp
-
-        integer :: smooth_patch_id !<
-        !! Identity (id) of the patch with which current patch is to get smoothed
-
-        real(wp) :: smooth_coeff !<
-        !! Smoothing coefficient (coeff) for the size of the stencil of
-        !! cells across which boundaries of the current patch will be smeared out
-
+        ! Geometry 13 (2D modal Fourier): fourier_cos(n), fourier_sin(n) for mode n
+        real(wp), dimension(1:max_2d_fourier_modes) :: fourier_cos, fourier_sin
+        !> When true, clip boundary radius: R(theta) = max(R(theta), modal_r_min) (Non-exp form only)
+        logical  :: modal_clip_r_to_min
+        real(wp) :: modal_r_min         !< Minimum boundary radius when modal_clip_r_to_min is true (Non-exp form only)
+        logical  :: modal_use_exp_form  !< When true, boundary = radius*exp(Fourier series)
+        ! Geometry 14 (3D spherical harmonic): sph_har_coeff(l,m) for real Y_lm
+        real(wp), dimension(0:max_sph_harm_degree,-max_sph_harm_degree:max_sph_harm_degree) :: sph_har_coeff
+        real(wp), dimension(3) :: normal  !< Patch orientation normal vector (x, y, z)
+        logical, dimension(0:num_patches_max - 1) :: alter_patch  !< Overwrite permissions for preceding patches
+        logical :: smoothen  !< Whether patch boundaries are smoothed across cells
+        integer :: smooth_patch_id  !< Identity (id) of the patch with which current patch is to get smoothed
+        real(wp) :: smooth_coeff  !< Smoothing stencil size coefficient
         real(wp), dimension(num_fluids_max) :: alpha_rho
         real(wp) :: rho
         real(wp), dimension(3) :: vel
         real(wp) :: pres
         real(wp), dimension(num_fluids_max) :: alpha
         real(wp) :: gamma
-        real(wp) :: pi_inf !<
-        real(wp) :: cv !<
-        real(wp) :: qv !<
-        real(wp) :: qvp !<
+        real(wp) :: pi_inf
+        real(wp) :: cv
+        real(wp) :: qv
+        real(wp) :: qvp  !< Reference entropy per unit mass (SGEOS)
+        real(wp) :: Bx, By, Bz  !< Magnetic field components; B%x is not used for 1D
+        real(wp), dimension(6) :: tau_e  !< Elastic stresses added to primitive variables if hypoelasticity = True
+        real(wp) :: R0  !< Bubble size
+        real(wp) :: V0  !< Bubble velocity
+        real(wp) :: p0  !< Bubble size
+        real(wp) :: m0  !< Bubble velocity
+        integer :: hcid  !< Hardcoded initial condition ID
+        real(wp) :: cf_val  !< Color function value
+        real(wp) :: Y(1:num_species)  !< Species mass fractions
 
-        !! Primitive variables associated with the patch. In order, these include
-        !! the partial densities, density, velocity, pressure, volume fractions,
-        !! specific heat ratio function and the liquid stiffness function.
-
-        real(wp), dimension(6) :: tau_e !<
-        !! Elastic stresses added to primitive variables if hypoelasticity = True
-
-        real(wp) :: R0 !< Bubble size
-        real(wp) :: V0 !< Bubble velocity
-
-        real(wp) :: p0 !< Bubble size
-        real(wp) :: m0 !< Bubble velocity
-
-        integer :: hcid
-        !! id for hard coded initial condition
-
-        real(wp) :: cf_val !! color function value
-        real(wp) :: Y(1:num_species)
-
-        !! STL or OBJ model input parameter
-        character(LEN=pathlen_max) :: model_filepath !<
-        !! Path the STL file relative to case_dir.
-
-        t_vec3 :: model_translate !<
-        !! Translation of the STL object.
-
-        t_vec3 :: model_scale !<
-        !! Scale factor for the STL object.
-
-        t_vec3 :: model_rotate !<
-        !! Angle to rotate the STL object along each cartesian coordinate axis,
-        !! in radians.
-
-        integer :: model_spc !<
-        !! Number of samples per cell to use when discretizing the STL object.
-
-        real(wp) :: model_threshold !<
-        !! Threshold to turn on smoothen STL patch.
-
+        ! STL/OBJ model patch: index into the shared stl_models(:) table
+        integer :: model_id  !< index into stl_models(:) for STL/OBJ geometry patches
     end type ic_patch_parameters
 
+    !> User-input parameters for a NACA 4-digit airfoil (namelist-safe: scalars only)
+    type ib_airfoil_parameters
+        real(wp) :: c = dflt_real  !< chord length
+        real(wp) :: p = dflt_real  !< maximum camber position (fraction of chord)
+        real(wp) :: t = dflt_real  !< maximum thickness (fraction of chord)
+        real(wp) :: m = dflt_real  !< maximum camber (fraction of chord)
+    end type ib_airfoil_parameters
+
+    !> Computed surface grid for a NACA airfoil (simulation-only, not in namelist)
+    type ib_airfoil_grid
+        integer                    :: Np = 0    !< number of surface grid points per surface
+        type(vec3_dt), allocatable :: upper(:)  !< upper surface grid points (1:Np)
+        type(vec3_dt), allocatable :: lower(:)  !< lower surface grid points (1:Np)
+    end type ib_airfoil_grid
+
+    !> User-input parameters for an STL/OBJ immersed boundary model (namelist-safe: scalars + fixed arrays)
+    type ib_stl_parameters
+        character(LEN=pathlen_max) :: model_filepath   !< Path to the STL file relative to case_dir.
+        real(wp), dimension(1:3)   :: model_translate  !< Translation of the STL object.
+        real(wp), dimension(1:3)   :: model_scale      !< Scale factor for the STL object.
+        real(wp)                   :: model_threshold  !< Threshold to turn on smooth STL patch.
+    end type ib_stl_parameters
+
     type ib_patch_parameters
+        integer  :: geometry                            !< Type of geometry for the patch
+        integer  :: gbl_patch_id
+        real(wp) :: x_centroid, y_centroid, z_centroid  !< Geometric center coordinates of the patch
 
-        integer :: geometry !< Type of geometry for the patch
-
-        real(wp) :: x_centroid, y_centroid, z_centroid !<
-        !! Location of the geometric center, i.e. the centroid, of the patch. It
-        !! is specified through its x-, y- and z-coordinates, respectively.
-
-        real(wp) :: c, p, t, m
-
-        real(wp) :: length_x, length_y, length_z !< Dimensions of the patch. x,y,z Lengths.
-        real(wp) :: radius !< Dimensions of the patch. radius.
-        real(wp) :: theta
-
+        !> Centroid locations of intermediate steps in the time_stepper module
+        real(wp)                 :: step_x_centroid, step_y_centroid, step_z_centroid
+        real(wp), dimension(1:3) :: centroid_offset  !< offset of center of mass from computed cell center for odd-shaped IBs
+        real(wp), dimension(1:3) :: angles
+        real(wp), dimension(1:3) :: step_angles
+        !> matrix that converts from IB reference frame to fluid reference frame
+        real(wp), dimension(1:3,1:3) :: rotation_matrix
+        !> matrix that converts from fluid reference frame to IB reference frame
+        real(wp), dimension(1:3,1:3) :: rotation_matrix_inverse
+        integer :: airfoil_id  !< index into ib_airfoil(:) for airfoil geometry patches
+        integer :: model_id  !< index into stl_models(:) for STL/OBJ geometry patches
+        real(wp) :: length_x, length_y, length_z  !< Dimensions of the patch. x,y,z Lengths.
+        real(wp) :: radius  !< Dimensions of the patch. radius.
         logical :: slip
-
-        !! STL or OBJ model input parameter
-        character(LEN=pathlen_max) :: model_filepath !<
-        !! Path the STL file relative to case_dir.
-
-        t_vec3 :: model_translate !<
-        !! Translation of the STL object.
-
-        t_vec3 :: model_scale !<
-        !! Scale factor for the STL object.
-
-        t_vec3 :: model_rotate !<
-        !! Angle to rotate the STL object along each cartesian coordinate axis,
-        !! in radians.
-
-        integer :: model_spc !<
-        !! Number of samples per cell to use when discretizing the STL object.
-
-        real(wp) :: model_threshold !<
-        !! Threshold to turn on smoothen STL patch.
+        integer :: moving_ibm  !< 0 for no moving, 1 for moving, 2 for moving on forced path
+        real(wp) :: v_blow  !< Wall-normal surface blowing speed (burning/transpiring IB surface); 0 = impermeable
+        integer :: inj_species  !< Injected species index at a blowing surface (chemistry); 0 = mirror ambient
+        real(wp) :: burn_rate_exp  !< Pressure exponent n in v_blow*(p/p_ref)^n (Vieille's law); 0 = constant blowing
+        real(wp) :: burn_rate_pref  !< Reference pressure p_ref for the pressure-coupled burn rate; 0 = coupling off
+        real(wp) :: mass, moment  !< mass and moment of inertia of object used to compute forces in 2-way coupling
+        real(wp), dimension(1:3) :: force, torque  !< vectors for the computed force and torque values applied to an IB
+        real(wp), dimension(1:3) :: vel
+        real(wp), dimension(1:3) :: step_vel  !< velocity array used to store intermediate steps in the time_stepper module
+        real(wp), dimension(1:3) :: angular_vel
+        real(wp), dimension(1:3) :: step_angular_vel  !< velocity array used to store intermediate steps in the time_stepper module
+        !> Prescribed kinematics (moving_ibm = 1 only): 0 = off; 1 = hinged flapping, roll about the lab x axis through the hinge
+        !! and pitch about the body spanwise (y) axis through the hinge, R = Rx(phi) Ry(theta)
+        integer :: kin_model
+        real(wp), dimension(1:3) :: kin_hinge  !< hinge point
+        real(wp), dimension(1:3) :: kin_offset  !< body-frame vector from the hinge to the patch centroid
+        real(wp) :: kin_phi0, kin_theta0, kin_theta_mean  !< roll amplitude, pitch amplitude, mean pitch (rad)
+        real(wp) :: kin_freq, kin_phase, kin_t0, kin_ramp  !< frequency, pitch phase lead (rad), onset time, ramp duration
+        real(wp) :: kin_pitch_rate, kin_smooth  !< kin_model = 2: nominal pitch rate (rad/time) and Eldredge smoothing parameter a
     end type ib_patch_parameters
 
-    !> Derived type annexing the physical parameters (PP) of the fluids. These
-    !! include the specific heat ratio function and liquid stiffness function.
+    type particle_cloud_parameters
+        real(wp) :: x_centroid, y_centroid, z_centroid  !< Center of the particle bed region
+        real(wp) :: length_x, length_y, length_z  !< Dimensions of the particle bed region
+        integer  :: num_particles  !< Number of particles to generate
+        real(wp) :: radius  !< Particle radius
+        real(wp) :: mass  !< Particle mass
+        real(wp) :: min_spacing  !< Minimum surface-to-surface gap (particle centers are 2*radius + min_spacing apart)
+        real(wp) :: shell_inner_radius  !< Inner radius for shell packing
+        real(wp) :: shell_outer_radius  !< Outer radius for shell packing
+        integer  :: moving_ibm  !< Motion flag: 0=static, 1=moving (forces), 2=forced path
+        integer  :: seed  !< Random seed for reproducible placement
+        integer  :: cloud_geometry  !< Cloud region geometry: 1=box, 2=hemisphere shell
+        integer  :: packing_method  !< Packing algorithm: 1=rejection sampling, 2=lattice
+        integer  :: periodic  !< Periodic overlap flag for box rejection packing: 0=off, 1=on
+    end type particle_cloud_parameters
+
+    !> Derived type annexing the physical parameters (PP) of the fluids. These include the specific heat ratio function and liquid
+    !! stiffness function.
     type physical_parameters
-        real(wp) :: gamma   !< Sp. heat ratio
-        real(wp) :: pi_inf  !< Liquid stiffness
-        real(wp), dimension(2) :: Re      !< Reynolds number
-        real(wp) :: cv      !< heat capacity
-        real(wp) :: qv      !< reference energy per unit mass for SGEOS, q (see Le Metayer (2004))
-        real(wp) :: qvp     !< reference entropy per unit mass for SGEOS, q' (see Le Metayer (2004))
-        real(wp) :: mul0    !< Bubble viscosity
-        real(wp) :: ss      !< Bubble surface tension
-        real(wp) :: pv      !< Bubble vapour pressure
-        real(wp) :: gamma_v !< Bubble constants (see Preston (2007), Ando (2010))
-        real(wp) :: M_v     !< Bubble constants (see Preston (2007), Ando (2010))
-        real(wp) :: mu_v    !< Bubble constants (see Preston (2007), Ando (2010))
-        real(wp) :: k_v     !< Bubble constants (see Preston (2007), Ando (2010))
-        real(wp) :: cp_v
-        real(wp) :: G
+        real(wp)               :: gamma              !< Sp. heat ratio
+        real(wp)               :: pi_inf             !< Liquid stiffness
+        real(wp), dimension(2) :: Re                 !< Reynolds number
+        real(wp)               :: cv                 !< heat capacity
+        real(wp)               :: qv                 !< reference energy per unit mass for SGEOS, q (see Le Metayer (2004))
+        real(wp)               :: qvp                !< reference entropy per unit mass for SGEOS, q' (see Le Metayer (2004))
+        real(wp)               :: G
+        integer                :: eos                !< Equation of state selector (eos_* in m_constants)
+        real(wp)               :: mg_rho0            !< Mie-Gruneisen reference density
+        real(wp)               :: mg_c0              !< Mie-Gruneisen bulk sound speed at mg_rho0
+        real(wp)               :: mg_s               !< Mie-Gruneisen linear Hugoniot slope, u_s = c0 + s u_p
+        real(wp)               :: mg_gruneisen       !< Gruneisen coefficient Gamma_G (not the shear modulus G)
+        real(wp)               :: mg_gruneisen_a     !< d(Gamma_G)/d(mu): Gamma_G = Gamma_0 + a mu, zero keeps it constant
+        real(wp)               :: mg_t0              !< temperature at the reference density (for T output)
+        real(wp)               :: mg_s2, mg_s3       !< u_s = c0 + s u_p + s2 u_p^2 + s3 u_p^3; zero keeps the fit linear
+        real(wp)               :: jwl_a              !< JWL A
+        real(wp)               :: jwl_b              !< JWL B
+        real(wp)               :: jwl_r1             !< JWL R1
+        real(wp)               :: jwl_r2             !< JWL R2
+        real(wp)               :: jwl_omega          !< JWL omega (its Gruneisen coefficient)
+        real(wp)               :: jwl_rho0           !< JWL reference density
+        real(wp)               :: jwl_t0             !< temperature at the reference density (for T output)
+        real(wp)               :: vinet_k0           !< Vinet bulk modulus at rho0
+        real(wp)               :: vinet_k0p          !< Vinet pressure derivative of the bulk modulus
+        real(wp)               :: vinet_rho0         !< Vinet reference density
+        real(wp)               :: vinet_gruneisen    !< Gruneisen coefficient at rho0
+        real(wp)               :: vinet_gruneisen_a  !< d(Gamma_G)/d(mu)
+        real(wp)               :: vinet_t0           !< temperature at the reference density (for T output)
+        logical                :: non_newtonian      !< Enable Herschel-Bulkley non-Newtonian viscosity
+        real(wp)               :: K                  !< HB consistency index
+        real(wp)               :: nn                 !< HB flow behavior index
+        real(wp)               :: tau0               !< HB yield stress (0 => power-law)
+        real(wp)               :: hb_m               !< Papanastasiou regularization parameter
+        real(wp)               :: mu_min             !< Lower viscosity clamp (inactive sentinel = dflt_real)
+        real(wp)               :: mu_max             !< Upper viscosity clamp (required when non_newtonian)
+        real(wp)               :: mu_bulk            !< Bulk viscosity for NN (inactive sentinel = dflt_real)
     end type physical_parameters
 
-    !> Derived type annexing the flow probe location
-    type probe_parameters
-        real(wp) :: x !< First coordinate location
-        real(wp) :: y !< Second coordinate location
-        real(wp) :: z !< Third coordinate location
-    end type probe_parameters
+    !> Derived type annexing the physical parameters required for sub-grid bubble models
+    type subgrid_bubble_physical_parameters
+        real(wp) :: R0ref    !< reference bubble radius
+        real(wp) :: p0ref    !< reference pressure
+        real(wp) :: rho0ref  !< reference density
+        real(wp) :: T0ref    !< reference temperature
+        real(wp) :: ss       !< surface tension between host and gas (bubble)
+        real(wp) :: pv       !< vapor pressure of host
+        real(wp) :: vd       !< vapor diffusivity in gas (bubble)
+        real(wp) :: mu_l     !< viscosity of host in liquid state
+        real(wp) :: mu_v     !< viscosity of host in vapor state
+        real(wp) :: mu_g     !< viscosity of gas (bubble)
+        real(wp) :: gam_v    !< specific heat ratio of host in vapor state
+        real(wp) :: gam_g    !< specific heat ratio of gas (bubble)
+        real(wp) :: M_v      !< Molecular weight of host
+        real(wp) :: M_g      !< Molecular weight of gas (bubble)
+        real(wp) :: k_v      !< thermal conductivity of host in vapor state
+        real(wp) :: k_g      !< thermal conductivity of gas (bubble)
+        real(wp) :: cp_v     !< specific heat capacity in constant pressure of host in vapor state
+        real(wp) :: cp_g     !< specific heat capacity in constant pressure of gas (bubble)
+        real(wp) :: R_v      !< gas constant of host in vapor state
+        real(wp) :: R_g      !< gas constant of gas (bubble)
+    end type subgrid_bubble_physical_parameters
 
     type mpi_io_airfoil_ib_var
-        integer, dimension(2) :: view
-        type(probe_parameters), allocatable, dimension(:) :: var
+        integer, dimension(2)                    :: view
+        type(vec3_dt), allocatable, dimension(:) :: var
     end type mpi_io_airfoil_ib_var
 
-    !> Derived type annexing integral regions
-    type integral_parameters
-        real(wp) :: xmin !< Min. boundary first coordinate direction
-        real(wp) :: xmax !< Max. boundary first coordinate direction
-        real(wp) :: ymin !< Min. boundary second coordinate direction
-        real(wp) :: ymax !< Max. boundary second coordinate direction
-        real(wp) :: zmin !< Min. boundary third coordinate direction
-        real(wp) :: zmax !< Max. boundary third coordinate direction
-    end type integral_parameters
+    !> Parameters for body force with spatial support
+    type spbf_parameters
+        real(wp)               :: amp
+        real(wp)               :: x_centroid
+        real(wp)               :: y_centroid
+        real(wp)               :: conv_vel
+        real(wp)               :: sigma
+        real(wp), dimension(8) :: freq
+        real(wp), dimension(8) :: phase
+    end type spbf_parameters
 
     !> Acoustic source parameters
     type acoustic_parameters
-        integer :: pulse !< Type of pulse
-        integer :: support !< Type of support
-        logical :: dipole !< Whether the source is a dipole or monopole
-        real(wp), dimension(3) :: loc !< Physical location of acoustic source
-        real(wp) :: mag !< Acoustic pulse magnitude
-        real(wp) :: length !< Length of planar source (2D/3D)
-        real(wp) :: height !< Height of planar source (3D)
-        real(wp) :: wavelength !< Wave length of pulse
-        real(wp) :: frequency !< Frequency of pulse
-        real(wp) :: gauss_sigma_dist !< sigma of Gaussian pulse multiplied by speed of sound
-        real(wp) :: gauss_sigma_time !< sigma of Gaussian pulse
-        real(wp) :: npulse !< Number of cycles of pulse
-        real(wp) :: dir !< Direction of pulse
-        real(wp) :: delay !< Time-delay of pulse start
-        real(wp) :: foc_length ! < Focal length of transducer
-        real(wp) :: aperture ! < Aperture diameter of transducer
-        real(wp) :: element_spacing_angle !< Spacing between aperture elements in 2D acoustic array
-        real(wp) :: element_polygon_ratio !< Ratio of aperture element diameter to side length of polygon connecting their centers, in 3D acoustic array
-        real(wp) :: rotate_angle !< Angle of rotation of the entire circular 3D acoustic array
-        real(wp) :: bb_bandwidth !< Bandwidth of each frequency in broadband wave
-        real(wp) :: bb_lowest_freq !< The lower frequency bound of broadband wave
-        integer :: num_elements !< Number of elements in the acoustic array
-        integer :: element_on !< Element in the acoustic array to turn on
-        integer :: bb_num_freq !< Number of frequencies in the broadband wave
+        integer                :: pulse                  !< Type of pulse
+        integer                :: support                !< Type of support
+        logical                :: dipole                 !< Whether the source is a dipole or monopole
+        real(wp), dimension(3) :: loc                    !< Physical location of acoustic source
+        real(wp)               :: mag                    !< Acoustic pulse magnitude
+        real(wp)               :: length                 !< Length of planar source (2D/3D)
+        real(wp)               :: height                 !< Height of planar source (3D)
+        real(wp)               :: wavelength             !< Wave length of pulse
+        real(wp)               :: frequency              !< Frequency of pulse
+        real(wp)               :: gauss_sigma_dist       !< sigma of Gaussian pulse multiplied by speed of sound
+        real(wp)               :: gauss_sigma_time       !< sigma of Gaussian pulse
+        real(wp)               :: npulse                 !< Number of cycles of pulse
+        real(wp)               :: dir                    !< Direction of pulse
+        real(wp)               :: delay                  !< Time-delay of pulse start
+        real(wp)               :: foc_length             !< Focal length of transducer
+        real(wp)               :: aperture               !< Aperture diameter of transducer
+        real(wp)               :: element_spacing_angle  !< Spacing between aperture elements in 2D acoustic array
+        !> Ratio of aperture element diameter to side length of polygon connecting their centers, in 3D acoustic array
+        real(wp) :: element_polygon_ratio
+        real(wp) :: rotate_angle    !< Angle of rotation of the entire circular 3D acoustic array
+        real(wp) :: bb_bandwidth    !< Bandwidth of each frequency in broadband wave
+        real(wp) :: bb_lowest_freq  !< The lower frequency bound of broadband wave
+        integer  :: num_elements    !< Number of elements in the acoustic array
+        integer  :: element_on      !< Element in the acoustic array to turn on
+        integer  :: bb_num_freq     !< Number of frequencies in the broadband wave
     end type acoustic_parameters
 
     !> Acoustic source source_spatial pre-calculated values
     type source_spatial_type
-        integer, dimension(:, :), allocatable :: coord !< List of grid points indices with non-zero source_spatial values
-        real(wp), dimension(:), allocatable :: val !< List of non-zero source_spatial values
-        real(wp), dimension(:), allocatable :: angle !< List of angles with x-axis for mom source term vector
-        real(wp), dimension(:, :), allocatable :: xyz_to_r_ratios !< List of [xyz]/r for mom source term vector
+        integer, pointer, dimension(:,:)  :: coord => null()  !< List of grid points indices with non-zero source_spatial values
+        real(wp), pointer, dimension(:)   :: val => null()  !< List of non-zero source_spatial values
+        real(wp), pointer, dimension(:)   :: angle => null()  !< List of angles with x-axis for mom source term vector
+        real(wp), pointer, dimension(:,:) :: xyz_to_r_ratios => null()  !< List of [xyz]/r for mom source term vector
     end type source_spatial_type
 
     !> Ghost Point for Immersed Boundaries
     type ghost_point
-        integer, dimension(3) :: loc !< Physical location of the ghost point
-        real(wp), dimension(3) :: ip_loc !< Physical location of the image point
-        integer, dimension(3) :: ip_grid !< Top left grid point of IP
-        real(wp), dimension(2, 2, 2) :: interp_coeffs !< Interpolation Coefficients of image point
-        integer :: ib_patch_id !< ID of the IB Patch the ghost point is part of
-        logical :: slip
-        integer, dimension(3) :: DB
+        integer, dimension(3)        :: loc            !< Physical location of the ghost point
+        real(wp), dimension(3)       :: ip_loc         !< Physical location of the image point
+        integer, dimension(3)        :: ip_grid        !< Top left grid point of IP
+        real(wp), dimension(2, 2, 2) :: interp_coeffs  !< Interpolation Coefficients of image point
+        integer                      :: ib_patch_id    !< ID of the IB Patch the ghost point is part of
+        real(wp)                     :: levelset
+        real(wp), dimension(1:3)     :: levelset_norm
+        logical                      :: slip
+        integer, dimension(3)        :: DB
+        integer                      :: x_periodicity, y_periodicity, z_periodicity
     end type ghost_point
 
     !> Species parameters
     type species_parameters
-        character(LEN=name_len) :: name !< Name of species
+        character(LEN=name_len) :: name  !< Name of species
     end type species_parameters
 
     !> Chemistry parameters
     type chemistry_parameters
-        character(LEN=name_len) :: cantera_file !< Path to Cantera file
-
-        logical :: diffusion
-        logical :: reactions
+        character(LEN=name_len) :: cantera_file  !< Path to Cantera file
+        logical                 :: diffusion
+        logical                 :: reactions
 
         !> Method of determining gamma.
         !> gamma_method = 1: Ref. Section 2.3.1 Formulation of doi:10.7907/ZKW8-ES97.
         !> gamma_method = 2: c_p / c_v where c_p, c_v are specific heats.
         integer :: gamma_method
+        integer :: transport_model
+        !> reaction_substeps > 0 integrates the reaction source with operator splitting: after the
+        !> flow update, each cell's constant-(rho,e) reactor ODE is advanced with this many alpha-QSS
+        !> sub-steps. Stabilizes stiff mechanisms (e.g. methane). 0 = off (reaction source is added to
+        !> the RHS and integrated by the flow time stepper, the default behavior).
+        integer :: reaction_substeps
+        !> adap_substeps = T: adapt the alpha-QSS sub-step count per rank each step from a local
+        !> stiffness estimate, ranging in [reaction_substeps (floor), reaction_substeps_max (ceiling)].
+        !> Zero MPI: each rank sizes its own work from its own cells. Default F = fixed reaction_substeps.
+        logical :: adap_substeps
+        integer :: reaction_substeps_max
     end type chemistry_parameters
+
+    !> Condensed-phase reactive-burn (programmed pressure detonation) parameters. The rate is
+    !> dlambda/dt = k (1 - lambda) ((p - pign)/pref)^n, optionally scaled by exp(-ta/T) when ta > 0.
+    type reactive_burn_parameters
+        real(wp) :: k         !< Rate coefficient [1/s]
+        real(wp) :: pign      !< Ignition pressure threshold [Pa]
+        real(wp) :: pref      !< Reference pressure for the pressure drive [Pa]
+        real(wp) :: n         !< Pressure-drive exponent
+        real(wp) :: ta        !< Activation temperature [K] (0 = pure pressure-driven; > 0 adds exp(-ta/T))
+        integer  :: substeps  !< Operator-split sub-steps per time step (0 = source added to the flow RHS)
+    end type reactive_burn_parameters
+
+    !> Coefficients of one fluid's equation of state, resolved once at init. Held as a record per fluid rather than as parallel
+    !! arrays: every read wants several of these for a single fluid, so one base address serves them all, where fifteen arrays cost
+    !! fifteen live descriptors in the Riemann kernels.
+    type eos_coefficients
+        real(wp) :: rho0, t0                 !< Reference density [kg/m^3] and temperature [K]
+        real(wp) :: gruneisen0, gruneisen_a  !< Gruneisen closure Gamma_G = Gamma_0 + a mu
+        real(wp) :: c0, s, s2, s3            !< Mie-Gruneisen Hugoniot u_s = c0 + s u_p + s2 u_p^2 + s3 u_p^3
+        real(wp) :: mu_max                   !< Compression at which a cubic Hugoniot fit turns over
+        real(wp) :: a, b, r1, r2             !< JWL principal isentrope p = A exp(-R1 V) + B exp(-R2 V)
+        real(wp) :: k0, k0p                  !< Vinet bulk modulus and its pressure derivative
+    end type eos_coefficients
 
     !> Lagrangian bubble parameters
     type bubbles_lagrange_parameters
 
-        integer :: solver_approach          !< 1: One-way coupling, 2: two-way coupling
-        integer :: cluster_type             !< Cluster model to find p_inf
-        logical :: pressure_corrector       !< Cell pressure correction term
-        integer :: smooth_type              !< Smoothing function. 1: Gaussian, 2:Delta 3x3
-        logical :: heatTransfer_model       !< Activate HEAT transfer model at the bubble-liquid interface
-        logical :: massTransfer_model       !< Activate MASS transfer model at the bubble-liquid interface
-        logical :: write_bubbles            !< Write files to track the bubble evolution each time step
-        logical :: write_bubbles_stats      !< Write the maximum and minimum radius of each bubble
-        integer :: nBubs_glb                !< Global number of bubbles
-        real(wp) :: epsilonb         !< Standard deviation scaling for the gaussian function
-        real(wp) :: charwidth        !< Domain virtual depth (z direction, for 2D simulations)
-        real(wp) :: valmaxvoid       !< Maximum void fraction permitted
-        real(wp) :: c0               !< Reference speed
-        real(wp) :: rho0             !< Reference density
-        real(wp) :: T0, Thost        !< Reference temperature and host temperature
-        real(wp) :: x0               !< Reference length
-        real(wp) :: diffcoefvap      !< Vapor diffusivity in the gas
-
+        integer                    :: solver_approach  !< 1: One-way coupling, 2: two-way coupling
+        integer                    :: cluster_type  !< Cluster model to find p_inf
+        logical                    :: pressure_corrector  !< Cell pressure correction term
+        integer                    :: smooth_type  !< Smoothing function. 1: Gaussian, 2:Delta 3x3
+        logical                    :: heatTransfer_model  !< Activate HEAT transfer model at the bubble-liquid interface
+        logical                    :: massTransfer_model  !< Activate MASS transfer model at the bubble-liquid interface
+        logical                    :: write_void_evol  !< Write files to track evolution of void fraction at each time step
+        logical                    :: write_bubbles  !< Write files to track the bubble evolution each time step
+        logical                    :: write_bubbles_stats  !< Write the maximum and minimum radius of each bubble
+        integer                    :: nBubs_glb  !< Global number of bubbles
+        integer                    :: vel_model  !< Particle velocity model
+        integer                    :: drag_model  !< Particle drag model
+        logical                    :: pressure_force  !< Include pressure force translational motion
+        logical                    :: gravity_force  !< Include gravity force in translational motion
+        logical                    :: kahan_summation  !< Use Kahan summation for void fraction accumulation (improves precision)
+        character(LEN=pathlen_max) :: input_path  !< Path to lag_bubbles.dat
+        real(wp)                   :: epsilonb  !< Standard deviation scaling for the gaussian function
+        real(wp)                   :: charwidth  !< Domain virtual depth (z direction, for 2D simulations)
+        integer                    :: charNz  !< Number of grid cells in characteristic depth
+        real(wp)                   :: valmaxvoid  !< Maximum void fraction permitted
     end type bubbles_lagrange_parameters
 
+    !> Max and min number of cells in a direction of each combination of x-,y-, and z-
+    type cell_num_bounds
+        integer :: mn_max, np_max, mp_max, mnp_max
+        integer :: mn_min, np_min, mp_min, mnp_min
+    end type cell_num_bounds
+
+    type simplex_noise_params
+        logical, dimension(3)                   :: perturb_vel
+        real(wp), dimension(3)                  :: perturb_vel_freq
+        real(wp), dimension(3)                  :: perturb_vel_scale
+        real(wp), dimension(3, 3)               :: perturb_vel_offset
+        logical, dimension(1:num_fluids_max)    :: perturb_dens
+        real(wp), dimension(1:num_fluids_max)   :: perturb_dens_freq
+        real(wp), dimension(1:num_fluids_max)   :: perturb_dens_scale
+        real(wp), dimension(1:num_fluids_max,3) :: perturb_dens_offset
+    end type simplex_noise_params
 end module m_derived_types

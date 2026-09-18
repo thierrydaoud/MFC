@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import math
 import json
+import math
 
 ps = 248758.567
 gam = 1.4
@@ -35,16 +35,16 @@ print(
             "p": 0,
             "dt": dt,
             "t_step_start": 0,
-            "t_step_stop": Nt,
-            "t_step_save": int(Nt / 20.0),
+            "t_step_stop": 1000,
+            "t_step_save": 10,
             # Simulation Algorithm Parameters
             "num_patches": 3,
-            "model_eqns": 2,
+            "model_eqns": "5eq",
             "alt_soundspeed": "F",
             "num_fluids": 2,
             "mpp_lim": "T",
             "mixture_err": "T",
-            "time_stepper": 3,
+            "time_stepper": "rk3",
             "weno_order": 5,
             "weno_eps": 1.0e-16,
             "weno_Re_flux": "F",
@@ -52,16 +52,16 @@ print(
             "mapped_weno": "T",
             "null_weights": "F",
             "mp_weno": "F",
-            "riemann_solver": 2,
-            "wave_speeds": 1,
-            "avg_state": 2,
+            "riemann_solver": "hllc",
+            "wave_speeds": "direct",
+            "avg_state": "arithmetic",
             "bc_x%beg": -6,
             "bc_x%end": -6,
             "bc_y%beg": -6,
             "bc_y%end": -6,
             # Formatted Database Files Structure Parameters
-            "format": 1,
-            "precision": 2,
+            "format": "silo",
+            "precision": "double",
             "prim_vars_wrt": "T",
             "parallel_io": "T",
             # Patch 1: Background
@@ -106,9 +106,9 @@ print(
             "patch_icpp(3)%alpha(2)": 1.0e00,
             # Fluids Physical Parameters
             "fluid_pp(1)%gamma": 1.0e00 / (1.4e00 - 1.0e00),
-            "fluid_pp(1)%pi_inf": 0.0,
+            "fluid_pp(1)%eos": "ideal_gas",
             "fluid_pp(2)%gamma": 1.0e00 / (1.6666e00 - 1.0e00),
-            "fluid_pp(2)%pi_inf": 0.0e00,
+            "fluid_pp(2)%eos": "ideal_gas",
         }
     )
 )

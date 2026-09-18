@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import math
 import json
+import math
 
 lam = 0.2
 h = 1.2
@@ -44,20 +44,20 @@ data = {
     "t_step_stop": Nt,
     "t_step_save": Ns,
     # Simulation Algorithm
-    "model_eqns": 3,
+    "model_eqns": "6eq",
     "alt_soundspeed": "F",
     "mixture_err": "T",
     "mpp_lim": "T",
-    "time_stepper": 3,
-    "avg_state": 2,
+    "time_stepper": "rk3",
+    "avg_state": "arithmetic",
     "weno_order": 5,
     "weno_eps": 1e-16,
     "mapped_weno": "T",
     "null_weights": "F",
     "mp_weno": "T",
     "weno_Re_flux": "T",
-    "riemann_solver": 2,
-    "wave_speeds": 1,
+    "riemann_solver": "hllc",
+    "wave_speeds": "direct",
     "bc_x%beg": -2,
     "bc_x%end": -2,
     "bc_y%beg": -16,
@@ -66,17 +66,17 @@ data = {
     "num_fluids": 2,
     "viscous": "T",
     # Database Structure Parameters
-    "format": 1,
-    "precision": 2,
+    "format": "silo",
+    "precision": "double",
     "prim_vars_wrt": "T",
     "parallel_io": "T",
     # Fluid Parameters (Heavy Gas)
     "fluid_pp(1)%gamma": 1.0e00 / (1.4e00 - 1.0e00),
-    "fluid_pp(1)%pi_inf": 0.0e00,
+    "fluid_pp(1)%eos": "ideal_gas",
     "fluid_pp(1)%Re(1)": 1 / 0.0219,
     # Fluid Parameters (Light Gas)
     "fluid_pp(2)%gamma": 1.0e00 / (1.4e00 - 1.0e00),
-    "fluid_pp(2)%pi_inf": 0.0e00,
+    "fluid_pp(2)%eos": "ideal_gas",
     "fluid_pp(2)%Re(1)": 1 / 0.0073,
     # Body Forces
     "bf_y": "T",
@@ -85,7 +85,7 @@ data = {
     "p_y": 0.0,
     "g_y": -9.81,
     # Water Patch
-    "patch_icpp(1)%geometry": 7,
+    "patch_icpp(1)%geometry": 3,
     "patch_icpp(1)%hcid": 204,
     "patch_icpp(1)%x_centroid": 0,
     "patch_icpp(1)%y_centroid": h / 2,

@@ -2,8 +2,8 @@
 # References:
 # + https://doi.org/10.1016/j.compfluid.2013.10.014: 4.3. Multi-component inert shock tube
 
-import json
 import argparse
+import json
 
 import cantera as ct
 
@@ -58,20 +58,20 @@ case = {
     "t_step_print": NS,
     "parallel_io": "F",
     # Simulation Algorithm Parameters
-    "model_eqns": 2,
+    "model_eqns": "5eq",
     "num_fluids": 1,
     "num_patches": 2,
     "mpp_lim": "F",
     "mixture_err": "F",
-    "time_stepper": 3,
+    "time_stepper": "rk3",
     "weno_order": 5,
     "weno_eps": 1e-16,
     "weno_avg": "F",
     "mapped_weno": "T",
     "mp_weno": "T",
-    "riemann_solver": 2,
-    "wave_speeds": 2,
-    "avg_state": 1,
+    "riemann_solver": "hllc",
+    "wave_speeds": "direct",
+    "avg_state": "arithmetic",
     "bc_x%beg": -2,
     "bc_x%end": -3,
     # Chemistry
@@ -79,8 +79,8 @@ case = {
     "chem_params%diffusion": "F",
     "chem_params%reactions": "T",
     # Formatted Database Files Structure Parameters
-    "format": 1,
-    "precision": 2,
+    "format": "silo",
+    "precision": "double",
     "prim_vars_wrt": "T",
     "patch_icpp(1)%geometry": 1,
     "patch_icpp(1)%x_centroid": -L / 4,
@@ -98,6 +98,7 @@ case = {
     "patch_icpp(2)%alpha_rho(1)": sol_R.density,
     # Fluids Physical Parameters
     "fluid_pp(1)%gamma": 1.0e00 / (1.55e00 - 1.0e00),
+    "fluid_pp(1)%eos": "stiffened_gas",
     "fluid_pp(1)%pi_inf": 0,
     # Chemistry
     "cantera_file": ctfile,
@@ -105,8 +106,8 @@ case = {
 
 if args.chemistry:
     for i in range(len(sol_L.Y)):
-        case[f"patch_icpp(1)%Y({i+1})"] = sol_L.Y[i]
-        case[f"patch_icpp(2)%Y({i+1})"] = sol_R.Y[i]
+        case[f"patch_icpp(1)%Y({i + 1})"] = sol_L.Y[i]
+        case[f"patch_icpp(2)%Y({i + 1})"] = sol_R.Y[i]
 
 if __name__ == "__main__":
     print(json.dumps(case))

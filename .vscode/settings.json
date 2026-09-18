@@ -1,7 +1,7 @@
 {
     "editor.detectIndentation": false,
     "editor.insertSpaces":      true,
-    "editor.tabSize":           4,
+    "editor.tabSize":           2,
     "editor.rulers":            [ 80, 120 ],
     "files.exclude": {
         "**/.git":      true,
@@ -9,6 +9,7 @@
         "**/build":     true,
         "**/*.o":       true,
         "**/*.mod":     true,
+        "**/misc/**":   true
     },
 
     "cmake.configureOnOpen": false,
@@ -17,15 +18,71 @@
 
     "files.associations": {
         "*.f90": "FortranFreeForm",
-        "*.fpp": "FortranFreeForm",
+        "*.fpp": "FortranFreeForm"
     },
 
-    "fortran.preferredCase":       "lowercase",
-    "fortran.linter.includePaths": [
-        "${workspacefolder}/src/${fileDirname}",
-        "${workspacefolder}/src/${fileDirname}/include",
-        "${workspacefolder}/src/common",
-        "${workspacefolder}/src/common/include"
+    "fortran.preferredCase": "lowercase",
+
+    // Use fortls for definitions, references, hover, symbols, and completion.
+    "fortran.provide.autocomplete": "fortls",
+    "fortran.provide.hover": "fortls",
+    "fortran.provide.symbols": "fortls",
+    "fortran.fortls.disabled": false,
+    "fortran.fortls.path": "fortls",
+    "fortran.fortls.configure": ".fortlsrc",
+    "fortran.fortls.notifyInit": true,
+    "fortran.fortls.disableAutoupdate": true,
+    "fortran.linter.compiler": "Disabled",
+
+    // Navigation aids for a large source tree.
+    "breadcrumbs.enabled": true,
+    "editor.stickyScroll.enabled": true,
+    "editor.gotoLocation.multipleDefinitions": "peek",
+    "editor.gotoLocation.multipleReferences": "peek",
+    "workbench.editor.navigationScope": "editorGroup",
+
+    "[fortran]": {
+        "editor.tabSize": 2
+    },
+    "[fortran-free]": {
+        "editor.tabSize": 2
+    },
+    "[FortranFreeForm]": {
+        "editor.tabSize": 2
+    },
+
+    // File exclusions - multiple layers of exclusion
+    "files.watcherExclude": {
+        "**/misc/**": true,
+        "**/benchmarks/**": true,
+        "**/examples/**": true,
+        "**/tests/**": true,
+        "**/build/**": true,
+        "**/m_nvtx*": true,
+        "**/syscheck.fpp": true
+    },
+
+    "search.exclude": {
+        "**/misc/**": true,
+        "**/benchmarks/**": true,
+        "**/examples/**": true,
+        "**/tests/**": true,
+        "**/build/**": true
+    },
+
+    // Keep problems panel available
+    "problems.showOn": "toggle",
+    "problems.defaultViewMode": "list",
+
+    // Case-file schema association. Run ./mfc.sh generate to (re)build
+    // toolchain/mfc-case-schema.json, which these entries point at.
+    "json.schemas": [
+        {
+            "fileMatch": ["**/case.json", "**/input.json", "**/mfc-case.json", "**/mfc.json"],
+            "url": "./toolchain/mfc-case-schema.json"
+        }
     ],
-    "fortran.linter.extraArgs":    ["--free-form"],
+    "yaml.schemas": {
+        "./toolchain/mfc-case-schema.json": ["**/case.yaml", "**/case.yml", "**/input.yaml", "**/input.yml", "**/mfc-case.yaml", "**/mfc.yaml"]
+    }
 }
