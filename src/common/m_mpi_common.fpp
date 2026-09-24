@@ -31,8 +31,9 @@ module m_mpi_common
     real(wp), private, allocatable, dimension(:) :: buff_recv
     type(int_bounds_info)                        :: comm_coords(3)
     integer                                      :: comm_size(3)
-    !> q_beta indices to communicate: 1=void fraction, 2=d(beta)/dt, 5=energy source
-    integer :: beta_vars(1:3) = [1, 2, 5]
+    !> q_beta indices to communicate. Bubbles: 1=void fraction, 2=d(beta)/dt, 5=energy source. Particles set their own.
+    integer, parameter :: num_beta_vars_max = 11
+    integer            :: beta_vars(1:num_beta_vars_max) = [1, 2, 5, 0, 0, 0, 0, 0, 0, 0, 0]
     $:GPU_DECLARE(create='[comm_coords, comm_size, beta_vars]')
 
 #ifndef __NVCOMPILER_GPU_UNIFIED_MEM
@@ -67,6 +68,9 @@ contains
         else
             v_size = sys_size
         end if
+
+        ! Lagrangian particles exchange up to 7 smeared fields at once
+        if (particles_lagrange) v_size = max(v_size, 7)
 
         if (n > 0) then
             if (p > 0) then

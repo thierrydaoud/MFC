@@ -18,6 +18,7 @@ module m_time_steppers
     use m_data_output
     use m_bubbles_EE
     use m_bubbles_EL
+    use m_particles_EL
     use m_ibm
     use m_collisions, only: collisions_active
     use m_mpi_proxy
@@ -494,6 +495,7 @@ contains
             end if
 
             if (bubbles_lagrange .and. .not. adap_dt) call s_update_lagrange_tdv_rk(q_prim_vf, bc_type, stage=s)
+            if (particles_lagrange) call s_update_lagrange_particles_tdv_rk(q_prim_vf, bc_type, stage=s)
             $:GPU_PARALLEL_LOOP(collapse=4)
             do i = 1, sys_size
                 do l = 0, p

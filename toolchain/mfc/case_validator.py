@@ -176,6 +176,16 @@ PHYSICS_DOCS = {
         "category": "Bubble Physics",
         "explanation": "2D/3D only. Requires polytropic = F and thermal = 3. Not compatible with model_eqns = 3. Kahan summation not compatible with --mixed precision.",
     },
+    "check_particles_lagrange": {
+        "title": "Euler-Lagrange Particle Model",
+        "category": "Particle Physics",
+        "explanation": (
+            "2D/3D only, 5-equation model, parallel_io = T; not with bubbles_lagrange or igr. "
+            "solver_approach in {1, 2}, qs_force in {0..3}, added_mass_force in {0, 1}, even interpolation_order > 0, "
+            "fd_order set for pressure-gradient/added-mass forces, charwidth > 0 in 2D, 0 < valmaxvoid < 1, epsilonb > 0. "
+            "Inviscid, non-chemistry QS drag needs mu_ref(l) > 0 per fluid; suth(l) is optional but positive if given."
+        ),
+    },
     "check_reactive_burn": {
         "title": "Condensed-Phase Reactive Burn",
         "category": "Combustion",
@@ -1866,6 +1876,44 @@ class CaseValidator:
         self.prohibit(fd_order == 0 and vel_model > 0, "Non-zero lag_params%vel_model requires fd_order to be set")
         self.prohibit(kahan_summation and CFG().mixed, "lag_params%kahan_summation = T is not compatible with --mixed precision")
 
+    def check_particles_lagrange(self):
+        """Checks Lagrangian particle parameters (simulation)"""
+        if self.get("particles_lagrange", "F") != "T":
+            return
+
+        pp = "particle_params%"
+        p = self.get("p", 0)
+        n = self.get("n", 0)
+        qs_force = self.get(f"{pp}qs_force", 0)
+        added_mass = self.get(f"{pp}added_mass_force", 0)
+        interp_order = self.get(f"{pp}interpolation_order")
+        fd_order = self.get("fd_order")
+        needs_gradients = self.get(f"{pp}pressure_gradient_force", "F") == "T" or added_mass > 0
+
+        self.prohibit(self.get("bubbles_lagrange", "F") == "T", "particles_lagrange and bubbles_lagrange cannot both be enabled")
+        self.prohibit(n is None or n == 0, "particles_lagrange requires at least 2D (n > 0)")
+        self.prohibit(self.get("igr", "F") == "T", "particles_lagrange is not compatible with igr")
+        self.prohibit(self.get("model_eqns") != 2, "particles_lagrange requires model_eqns = 2 (5-equation model)")
+        self.prohibit(self.get("parallel_io", "F") != "T", "particles_lagrange requires parallel_io = T (particle restart and output)")
+        self.prohibit(self.get(f"{pp}solver_approach") not in (1, 2), f"{pp}solver_approach must be 1 (one-way) or 2 (two-way)")
+        self.prohibit(qs_force not in (0, 1, 2, 3), f"{pp}qs_force must be 0 (off), 1 (Gidaspow), 2 (Parmar), or 3 (Osnes)")
+        self.prohibit(added_mass not in (0, 1), f"{pp}added_mass_force must be 0 (off) or 1")
+        self.prohibit((self.get(f"{pp}nparticles_glb") or 0) <= 0, f"{pp}nparticles_glb must be positive")
+        self.prohibit(interp_order is None or interp_order <= 0 or interp_order % 2 != 0, f"{pp}interpolation_order must be a positive even integer")
+        self.prohibit(needs_gradients and (fd_order is None or fd_order <= 0), "fd_order must be set for the particle pressure-gradient or added-mass force")
+        self.prohibit(p == 0 and (self.get(f"{pp}charwidth") or 0) <= 0, f"{pp}charwidth must be positive for 2D particles_lagrange")
+        valmaxvoid = self.get(f"{pp}valmaxvoid")
+        self.prohibit(valmaxvoid is None or not 0 < valmaxvoid < 1, f"{pp}valmaxvoid must be in (0, 1)")
+        self.prohibit(self.get(f"{pp}epsilonb", 1.0) <= 0, f"{pp}epsilonb must be positive")
+
+        # Drag viscosity for inviscid, non-chemistry cases: constant mu_ref, optionally corrected by Sutherland's law
+        if qs_force > 0 and self.get("viscous", "F") != "T" and self.get("chemistry", "F") != "T":
+            for fluid in range(1, self.get("num_fluids", 1) + 1):
+                mu_ref = self.get(f"{pp}mu_ref({fluid})")
+                suth = self.get(f"{pp}suth({fluid})")
+                self.prohibit(mu_ref is None or mu_ref <= 0, f"{pp}mu_ref({fluid}) must be positive for QS drag in an inviscid case")
+                self.prohibit(suth is not None and suth <= 0, f"{pp}suth({fluid}) must be positive if given")
+
     def check_continuum_damage(self):
         """Checks continuum damage model parameters (simulation)"""
         cont_damage = self.get("cont_damage", "F") == "T"
@@ -3016,6 +3064,7 @@ class CaseValidator:
         self.check_adaptive_time_stepping()
         self.check_alt_soundspeed()
         self.check_bubbles_lagrange()
+        self.check_particles_lagrange()
         self.check_continuum_damage()
         self.check_grcbc()
         self.check_probe_output()

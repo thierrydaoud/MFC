@@ -22,6 +22,7 @@ module m_rhs
     use m_cbc
     use m_bubbles_EE
     use m_bubbles_EL
+    use m_particles_EL
     use m_qbmm
     use m_hypoelastic
     use m_acoustic_src
@@ -125,6 +126,10 @@ module m_rhs
     $:GPU_DECLARE(create='[blkmod1, blkmod2, alpha1, alpha2, Kterm]')
     $:GPU_DECLARE(create='[qL_rsx_vf, qR_rsx_vf]')
     $:GPU_DECLARE(create='[dqL_rsx_vf, dqR_rsx_vf]')
+
+    !> Reconstructed states saved per direction for Lagrangian particle field gradients
+    real(wp), allocatable, dimension(:,:,:,:) :: qL_rsx_save, qR_rsx_save, qL_rsy_save, qR_rsy_save, qL_rsz_save, qR_rsz_save
+    $:GPU_DECLARE(create='[qL_rsx_save, qR_rsx_save, qL_rsy_save, qR_rsy_save, qL_rsz_save, qR_rsz_save]')
 
     integer :: iglob
     $:GPU_DECLARE(create='[iglob]')
@@ -325,6 +330,13 @@ contains
                        & 1:sys_size))
             @:ALLOCATE(qR_rsx_vf(idwbuff(1)%beg:idwbuff(1)%end, idwbuff(2)%beg:idwbuff(2)%end, idwbuff(3)%beg:idwbuff(3)%end, &
                        & 1:sys_size))
+
+            if (particles_lagrange) then
+                #:for SAVE in ['qL_rsx_save', 'qR_rsx_save', 'qL_rsy_save', 'qR_rsy_save', 'qL_rsz_save', 'qR_rsz_save']
+                    @:ALLOCATE(${SAVE}$(idwbuff(1)%beg:idwbuff(1)%end, idwbuff(2)%beg:idwbuff(2)%end, &
+                               & idwbuff(3)%beg:idwbuff(3)%end, 1:sys_size))
+                #:endfor
+            end if
 
             if (.not. viscous) then
                 do i = 1, num_dims
@@ -874,6 +886,19 @@ contains
             end if
         end if
 
+        if (particles_lagrange) then
+            call nvtxStartRange("RHS-EL-PARTICLES-DYN")
+            call s_compute_particle_EL_dynamics(q_cons_qp%vf(1:sys_size), q_prim_qp%vf(1:sys_size), bc_type, stage, qL_rsx_save, &
+                                                & qL_rsy_save, qL_rsz_save, qR_rsx_save, qR_rsy_save, qR_rsz_save, rhs_vf)
+            call nvtxEndRange
+
+            if (particle_params%solver_approach == 2) then
+                call nvtxStartRange("RHS-EL-PARTICLES-SRC")
+                call s_compute_particles_EL_source(q_cons_qp%vf(1:sys_size), q_prim_qp%vf(1:sys_size), rhs_vf, stage)
+                call nvtxEndRange
+            end if
+        end if
+
         ! When reaction_substeps > 0 the reaction source is integrated by operator splitting
         ! after the flow update (s_chemistry_reaction_substep), not added to the flow RHS here.
         if (chemistry .and. chem_params%reactions .and. chem_params%reaction_substeps == 0) then
@@ -894,7 +919,7 @@ contains
 
         ! END: Additional physics and source terms
 
-        if (run_time_info .or. probe_wrt .or. ib .or. bubbles_lagrange) then
+        if (run_time_info .or. probe_wrt .or. ib .or. bubbles_lagrange .or. particles_lagrange) then
             if (.not. igr) then
                 $:GPU_PARALLEL_LOOP(private='[i, j, k, l]', collapse=4)
                 do i = 1, sys_size
@@ -1012,6 +1037,26 @@ contains
                         & idwbuff(2), idwbuff(3))
                 end if
             end if
+        end if
+
+        ! Keep this direction's reconstructed states for the Lagrangian particle field gradients
+        if (particles_lagrange) then
+            #:for ID, DIR in [(1, 'x'), (2, 'y'), (3, 'z')]
+                if (id == ${ID}$) then
+                    $:GPU_PARALLEL_LOOP(collapse=4, private='[i, j, k, l]')
+                    do i = 1, sys_size
+                        do l = idwbuff(3)%beg, idwbuff(3)%end
+                            do k = idwbuff(2)%beg, idwbuff(2)%end
+                                do j = idwbuff(1)%beg, idwbuff(1)%end
+                                    qL_rs${DIR}$_save(j, k, l, i) = qL_rsx_vf(j, k, l, i)
+                                    qR_rs${DIR}$_save(j, k, l, i) = qR_rsx_vf(j, k, l, i)
+                                end do
+                            end do
+                        end do
+                    end do
+                    $:END_GPU_PARALLEL_LOOP()
+                end if
+            #:endfor
         end if
 
         call nvtxEndRange
@@ -2148,6 +2193,9 @@ contains
 
         if (.not. igr) then
             @:DEALLOCATE(qL_rsx_vf, qR_rsx_vf)
+            if (particles_lagrange) then
+                @:DEALLOCATE(qL_rsx_save, qR_rsx_save, qL_rsy_save, qR_rsy_save, qL_rsz_save, qR_rsz_save)
+            end if
 
             if (viscous) then
                 do l = eqn_idx%mom%beg, eqn_idx%mom%end

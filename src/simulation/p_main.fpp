@@ -59,6 +59,13 @@ program p_main
 
     call nvtxEndRange  ! INIT
 
+    ! Save the initial state so post_process sees the smeared particle volume fraction at t = 0
+    if (particles_lagrange) then
+        call nvtxStartRange("SAVE-INIT-PARTICLES")
+        call s_save_data(t_step, start, finish, io_time_avg, nt)
+        call nvtxEndRange  ! SAVE-INIT-PARTICLES
+    end if
+
     call nvtxStartRange("SIMULATION-TIME-MARCH")
     ! Time-stepping Loop
     do

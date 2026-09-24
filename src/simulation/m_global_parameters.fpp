@@ -308,6 +308,9 @@ module m_global_parameters
     $:GPU_DECLARE(create='[lag_pressure_force, lag_gravity_force]')
     !> @}
 
+    integer :: n_el_particles_loc, n_el_particles_glb  !< Number of Lagrangian solid particles (local and global)
+    $:GPU_DECLARE(create='[n_el_particles_loc, n_el_particles_glb]')
+
     !> @name Continuum damage model parameters
     !> @{!
     !> @}
@@ -509,6 +512,33 @@ contains
         bub_pp%cp_g = dflt_real; cp_g = dflt_real
         bub_pp%R_v = dflt_real; R_v = dflt_real
         bub_pp%R_g = dflt_real; R_g = dflt_real
+
+        ! Subgrid particle physical parameters
+        particle_pp%rho0ref_particle = dflt_real
+        particle_pp%cp_particle = dflt_real
+        particle_pp%ksp_col = dflt_real
+        particle_pp%nu_col = dflt_real
+        particle_pp%E_col = dflt_real
+        particle_pp%cor_col = dflt_real
+
+        ! Lagrangian particle solver parameters
+        particle_params%solver_approach = dflt_int
+        particle_params%write_void_evol = .false.
+        particle_params%write_particles = .false.
+        particle_params%write_particles_stats = .false.
+        particle_params%nparticles_glb = dflt_int
+        particle_params%stationary = .false.
+        particle_params%qs_force = dflt_int
+        particle_params%qs_fluct_force = .false.
+        particle_params%pressure_gradient_force = .false.
+        particle_params%added_mass_force = dflt_int
+        particle_params%mu_ref = dflt_real
+        particle_params%suth = dflt_real
+        particle_params%interpolation_order = dflt_int
+        particle_params%input_path = 'input/lag_particles.dat'
+        particle_params%epsilonb = 1._wp
+        particle_params%charwidth = dflt_real
+        particle_params%valmaxvoid = dflt_real
 
         ! Immersed Boundaries (sim-specific extras)
         ib_neighborhood_radius = 0
@@ -887,7 +917,7 @@ contains
         if (bubbles_euler .and. qbmm .and. .not. polytropic) then
             allocate (MPI_IO_DATA%view(1:sys_size + 2*nb*nnode))
             allocate (MPI_IO_DATA%var(1:sys_size + 2*nb*nnode))
-        else if (bubbles_lagrange) then
+        else if (bubbles_lagrange .or. particles_lagrange) then
             allocate (MPI_IO_DATA%view(1:sys_size + 1))
             allocate (MPI_IO_DATA%var(1:sys_size + 1))
         else
@@ -906,7 +936,7 @@ contains
                 allocate (MPI_IO_DATA%var(i)%sf(0:m,0:n,0:p))
                 MPI_IO_DATA%var(i)%sf => null()
             end do
-        else if (bubbles_lagrange) then
+        else if (bubbles_lagrange .or. particles_lagrange) then
             do i = 1, sys_size + 1
                 allocate (MPI_IO_DATA%var(i)%sf(0:m,0:n,0:p))
                 MPI_IO_DATA%var(i)%sf => null()
@@ -924,7 +954,7 @@ contains
 
         if (ib) allocate (MPI_IO_IB_DATA%var%sf(0:m,0:n,0:p))
 
-        if (hypoelasticity .or. mhd .or. probe_wrt .or. ib .or. bubbles_lagrange) then
+        if (hypoelasticity .or. mhd .or. probe_wrt .or. ib .or. bubbles_lagrange .or. particles_lagrange) then
             fd_number = max(1, fd_order/2)
         end if
 
@@ -957,7 +987,7 @@ contains
         end if
 
         call s_configure_coordinate_bounds(recon_type, weno_polyn, muscl_polyn, igr_order, buff_size, idwint, idwbuff, viscous, &
-                                           & bubbles_lagrange, m, n, p, num_dims, igr, ib, fd_number)
+                                           & bubbles_lagrange, particles_lagrange, m, n, p, num_dims, igr, ib, fd_number)
         $:GPU_UPDATE(device='[idwint, idwbuff]')
 
         ! Configuring Coordinate Direction Indexes
@@ -1093,7 +1123,7 @@ contains
         call s_finalize_global_parameters_common
 
         if (parallel_io) then
-            if (bubbles_lagrange) then
+            if (bubbles_lagrange .or. particles_lagrange) then
                 do i = 1, sys_size + 1
                     MPI_IO_DATA%var(i)%sf => null()
                 end do

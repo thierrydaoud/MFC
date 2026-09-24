@@ -461,6 +461,16 @@ module m_derived_types
         real(wp) :: R_g      !< gas constant of gas (bubble)
     end type subgrid_bubble_physical_parameters
 
+    !> Physical parameters for Lagrangian solid particles
+    type subgrid_particle_physical_parameters
+        real(wp) :: rho0ref_particle  !< Reference particle density
+        real(wp) :: cp_particle       !< Specific heat capacity of particle
+        real(wp) :: ksp_col           !< number of timesteps over which collision occurs
+        real(wp) :: nu_col            !< Poisson's ratio of particle for collision
+        real(wp) :: E_col             !< Young's modulus of particle for collision
+        real(wp) :: cor_col           !< coefficient of restituion for collision
+    end type subgrid_particle_physical_parameters
+
     type mpi_io_airfoil_ib_var
         integer, dimension(2)                    :: view
         type(vec3_dt), allocatable, dimension(:) :: var
@@ -603,6 +613,27 @@ module m_derived_types
         integer                    :: charNz  !< Number of grid cells in characteristic depth
         real(wp)                   :: valmaxvoid  !< Maximum void fraction permitted
     end type bubbles_lagrange_parameters
+
+    type particle_lagrange_parameters
+
+        integer                             :: solver_approach  !< 1: One-way coupling, 2: two-way coupling
+        logical                             :: write_void_evol  !< Write files to track evolution of void fraction at each time step
+        logical                             :: write_particles  !< Write files to track the particle evolution each time step
+        logical                             :: write_particles_stats  !< Write max/min radius statistics of the particles
+        integer                             :: nparticles_glb  !< Global number of particles
+        logical                             :: stationary  !< Keep particles fixed in space
+        integer                             :: qs_force  !< Quasi-steady drag. 0: off, 1: Gidaspow, 2: Parmar, 3: Osnes
+        logical                             :: qs_fluct_force  !< Quasi-steady fluctuation force
+        logical                             :: pressure_gradient_force  !< Pressure gradient force
+        integer                             :: added_mass_force  !< Particle added mass model
+        real(wp), dimension(num_fluids_max) :: mu_ref  !< Sutherland reference viscosity per fluid
+        real(wp), dimension(num_fluids_max) :: suth  !< Sutherland constant per fluid
+        integer                             :: interpolation_order  !< Fluid-to-Particle barycentric interpolation order
+        character(LEN=pathlen_max)          :: input_path  !< Path to lag_particles.dat
+        real(wp)                            :: epsilonb  !< Standard deviation scaling for the gaussian function
+        real(wp)                            :: charwidth  !< Domain virtual depth (z direction, for 2D simulations)
+        real(wp)                            :: valmaxvoid  !< Maximum void fraction permitted
+    end type particle_lagrange_parameters
 
     !> Max and min number of cells in a direction of each combination of x-,y-, and z-
     type cell_num_bounds
