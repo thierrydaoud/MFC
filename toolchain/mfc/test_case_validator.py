@@ -638,6 +638,10 @@ class TestHeatConduction(ConstraintTestCase):
 # A minimal 2D Lagrangian particle case satisfying every particle constraint.
 PARTICLES = {
     **BASE_2D,
+    "bc_x%beg": -3,
+    "bc_x%end": -3,
+    "bc_y%beg": -3,
+    "bc_y%end": -3,
     "parallel_io": "T",
     "fd_order": 2,
     "particles_lagrange": "T",
@@ -706,6 +710,12 @@ class TestParticlesLagrange(ConstraintTestCase):
 
     def test_suth_positive_if_given(self):
         self.assertRejects({**PARTICLES, "particle_params%suth(1)": -1.0}, "suth(1) must be positive")
+
+    def test_no_periodic_boundaries(self):
+        self.assertRejects({**PARTICLES, "bc_y%beg": -1, "bc_y%end": -1}, "periodic and reflective boundaries are not yet supported")
+
+    def test_no_reflective_boundaries(self):
+        self.assertRejects({**PARTICLES, "bc_x%beg": -2}, "bc_x%beg = -2")
 
     def test_mu_ref_not_needed_without_drag(self):
         params = {k: v for k, v in PARTICLES.items() if k != "particle_params%mu_ref(1)"}

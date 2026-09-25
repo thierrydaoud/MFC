@@ -180,7 +180,7 @@ PHYSICS_DOCS = {
         "title": "Euler-Lagrange Particle Model",
         "category": "Particle Physics",
         "explanation": (
-            "2D/3D only, 5-equation model, parallel_io = T; not with bubbles_lagrange or igr. "
+            "2D/3D only, 5-equation model, parallel_io = T; not with bubbles_lagrange, igr, or periodic/reflective boundaries (not yet supported). "
             "solver_approach in {1, 2}, qs_force in {0..3}, added_mass_force in {0, 1}, even interpolation_order > 0, "
             "fd_order set for pressure-gradient/added-mass forces, charwidth > 0 in 2D, 0 < valmaxvoid < 1, epsilonb > 0. "
             "Inviscid, non-chemistry QS drag needs mu_ref(l) > 0 per fluid; suth(l) is optional but positive if given."
@@ -1902,6 +1902,11 @@ class CaseValidator:
         self.prohibit(interp_order is None or interp_order <= 0 or interp_order % 2 != 0, f"{pp}interpolation_order must be a positive even integer")
         self.prohibit(needs_gradients and (fd_order is None or fd_order <= 0), "fd_order must be set for the particle pressure-gradient or added-mass force")
         self.prohibit(p == 0 and (self.get(f"{pp}charwidth") or 0) <= 0, f"{pp}charwidth must be positive for 2D particles_lagrange")
+        # Periodic/reflective boundaries run the smeared-field BC routines and particle wrapping, not yet verified for particles
+        for d in ("x", "y", "z"):
+            for loc in ("beg", "end"):
+                bc = self.get(f"bc_{d}%{loc}")
+                self.prohibit(bc in (-1, -2), f"bc_{d}%{loc} = {bc}: periodic and reflective boundaries are not yet supported with particles_lagrange")
         valmaxvoid = self.get(f"{pp}valmaxvoid")
         self.prohibit(valmaxvoid is None or not 0 < valmaxvoid < 1, f"{pp}valmaxvoid must be in (0, 1)")
         self.prohibit(self.get(f"{pp}epsilonb", 1.0) <= 0, f"{pp}epsilonb must be positive")

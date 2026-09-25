@@ -1109,7 +1109,7 @@ When ``polytropic = 'F'``, the gas compression is modeled as non-polytropic due 
 | `particle_params%%write_particles_stats`  | Logical | Write particle statistics to `D/stats_lag_particles_<rank>.dat`     |
 | `particle_params%%write_void_evol`        | Logical | Write the volume fraction evolution over time                       |
 
-- `particles_lagrange` activates the Euler-Lagrange solid particle model: rigid spherical particles are tracked individually and projected onto the grid with the Gaussian kernel of \cite Maeda18. It requires a 2D or 3D case, `model_eqns = 2`, and ``parallel_io = 'T'``, and cannot be combined with `bubbles_lagrange` or `igr`. Particle collisions are not yet modeled.
+- `particles_lagrange` activates the Euler-Lagrange solid particle model: rigid spherical particles are tracked individually and projected onto the grid with the Gaussian kernel of \cite Maeda18. It requires a 2D or 3D case, `model_eqns = 2`, and ``parallel_io = 'T'``, and cannot be combined with `bubbles_lagrange` or `igr`. Periodic and reflective (symmetry) boundaries and particle collisions are not yet supported.
 
 - `input_path` Path to the particle input file. Each row specifies one particle, with columns `x  y  z  u  v  w  radius`; any extra columns are ignored.
 
