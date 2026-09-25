@@ -754,7 +754,7 @@ contains
         !> Compute Fluid-Particle Forces (drag/pressure/added mass) and convert to particle acceleration
         $:GPU_PARALLEL_LOOP(private='[i, k, l, cell, s_cell, myMass, myR, myR0, myPos, myVel, mySeed, my_fqs_fluct, &
                             & new_fqs_fluct, force_vec, rmass_add, func_sum, new_seed, myFluidVel, myFluidRho, myPres, qv, &
-                            & pi_inf, gamma, myGamma, vel_sum, vel, alpha, alpha_rho, Re, myRe, pres, rho, i_c, j_c, k_c]', copyin='[stage]')
+                            & pi_inf, gamma, myGamma, vel_sum, vel, alpha, alpha_rho, Re, myRe, pres, rho, i_c, j_c, k_c, c]', copyin='[stage]')
         do k = 1, n_el_particles_loc
             f_p(k,:) = 0._wp
             p_owner_rank(k) = proc_rank
@@ -909,7 +909,7 @@ contains
         end do
         $:END_GPU_PARALLEL_LOOP()
 
-        $:GPU_PARALLEL_LOOP(private='[i, k, cell, s_cell, myR, myPos, myVel, myForce, func_sum, func_sum_sources_dummy]')
+        $:GPU_PARALLEL_LOOP(private='[i, k, cell, s_cell, myR, myPos, myVel, myForce, func_sum, func_sum_sources, func_sum_sources_dummy]')
         do k = 1, n_el_particles_loc
             myR = particle_rad(k, 2)
             myPos = particle_pos(k,1:3,2)
