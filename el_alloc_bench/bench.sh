@@ -4,6 +4,9 @@
 # BENCH_NPS sets the particle counts (default "1e5 1e6 4e6"); BENCH_GRID scales the 200x100x100 grid.
 # BENCH_RUN_ARGS are the launcher arguments for ./mfc.sh run (default "-b mpirun"; on Tuolumne use "-c tuo").
 set -uo pipefail
+if [ $# -lt 2 ] || [ ! -x "$1/mfc.sh" ]; then
+    echo "Usage: $0 <mfc_checkout> <label> [ranks ...]  (no mfc.sh in '${1:-}')" >&2; exit 1
+fi
 mfc=$(cd "$1" && pwd); label=$2; shift 2
 ranks=${*:-1 2 4}
 nps=${BENCH_NPS:-1e5 1e6 4e6}
