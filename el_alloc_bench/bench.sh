@@ -15,7 +15,7 @@ mfc_run() { (cd "$mfc" && ./mfc.sh run "$@"); }
 
 # Print the used device memory (MiB) of every GPU every 0.2 s: nvidia-smi on NVIDIA, rocm-smi on AMD
 sample_gpu_mem() {
-    if command -v nvidia-smi > /dev/null; then
+    if nvidia-smi -L > /dev/null 2>&1; then
         nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -lms 200
     else
         while true; do
@@ -46,7 +46,7 @@ for r in $ranks; do
                 wall=FAIL
             fi
             kill $smi; wait $smi 2>/dev/null
-            echo "$label,$r,$np,$steps,$wall,$(sort -n "$dir/mem_$steps.log" | tail -1)" | tee -a "$csv"
+            echo "$label,$r,$np,$steps,$wall,$(grep -E '^[0-9]+$' "$dir/mem_$steps.log" | sort -n | tail -1)" | tee -a "$csv"
         done
     done
 done
