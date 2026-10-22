@@ -10,6 +10,9 @@ nps=${BENCH_NPS:-1e5 1e6 4e6}
 run_args=${BENCH_RUN_ARGS:--b mpirun}
 here=$(cd "$(dirname "$0")" && pwd)
 
+# ./mfc.sh must run from the checkout's root
+mfc_run() { (cd "$mfc" && ./mfc.sh run "$@"); }
+
 # Print the used device memory (MiB) of every GPU every 0.2 s: nvidia-smi on NVIDIA, rocm-smi on AMD
 sample_gpu_mem() {
     if command -v nvidia-smi > /dev/null; then
@@ -29,7 +32,7 @@ for r in $ranks; do
         dir=$here/runs/$label-r$r-np$np
         rm -rf "$dir"; mkdir -p "$dir"; cp "$here/case.py" "$dir/"
         export BENCH_NP=$np
-        if ! BENCH_STEPS=20 "$mfc/mfc.sh" run "$dir/case.py" -t pre_process -n "$r" $run_args --no-build > "$dir/pre.log" 2>&1; then
+        if ! BENCH_STEPS=20 mfc_run "$dir/case.py" -t pre_process -n "$r" $run_args --no-build > "$dir/pre.log" 2>&1; then
             echo "$label,$r,$np,pre_process,FAIL," | tee -a "$csv"; continue
         fi
         for steps in 20 220; do
@@ -37,7 +40,7 @@ for r in $ranks; do
             sample_gpu_mem > "$dir/mem_$steps.log" &
             smi=$!
             t0=$(date +%s.%N)
-            if "$mfc/mfc.sh" run "$dir/case.py" -t simulation -n "$r" $run_args --no-build > "$dir/sim_$steps.log" 2>&1; then
+            if mfc_run "$dir/case.py" -t simulation -n "$r" $run_args --no-build > "$dir/sim_$steps.log" 2>&1; then
                 wall=$(awk "BEGIN{print $(date +%s.%N) - $t0}")
             else
                 wall=FAIL
